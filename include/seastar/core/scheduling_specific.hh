@@ -21,6 +21,7 @@
 
 #include <boost/range/adaptor/filtered.hpp>
 #include <seastar/core/scheduling.hh>
+#include <seastar/core/map_reduce.hh>
 #include <array>
 #include <vector>
 
@@ -45,16 +46,38 @@ struct scheduling_group_specific_thread_local_data {
 };
 
 inline
-scheduling_group_specific_thread_local_data** get_scheduling_group_specific_thread_local_data_ptr() {
+scheduling_group_specific_thread_local_data** get_scheduling_group_specific_thread_local_data_ptr() noexcept {
     static thread_local scheduling_group_specific_thread_local_data* data;
     return &data;
 }
 inline
-scheduling_group_specific_thread_local_data& get_scheduling_group_specific_thread_local_data() {
+scheduling_group_specific_thread_local_data& get_scheduling_group_specific_thread_local_data() noexcept {
     return **get_scheduling_group_specific_thread_local_data_ptr();
 }
 
 [[noreturn]] void no_such_scheduling_group(scheduling_group sg);
+
+/**
+ * Returns a pointer to the given scheduling group specific data.
+ * @param sg - The scheduling group which it's data needs to be accessed
+ * @param key - The scheduling group key that for the data to access
+ * @return A pointer of type T* to the data, if sg is valid initialized.
+ *
+ * @note The parameter T has to be given since there is no way to deduce it.
+ */
+template<typename T>
+T* scheduling_group_get_specific_ptr(scheduling_group sg, scheduling_group_key key) noexcept {
+    auto& data = internal::get_scheduling_group_specific_thread_local_data();
+#ifdef SEASTAR_DEBUG
+    assert(std::type_index(typeid(T)) == data.scheduling_group_key_configs[key.id()].type_index);
+#endif
+    auto sg_id = internal::scheduling_group_index(sg);
+    if (__builtin_expect(sg_id < data.per_scheduling_group_data.size() &&
+            data.per_scheduling_group_data[sg_id].queue_is_initialized, true)) {
+        return reinterpret_cast<T*>(data.per_scheduling_group_data[sg_id].specific_vals[key.id()]);
+    }
+    return nullptr;
+}
 
 }
 
@@ -65,18 +88,15 @@ scheduling_group_specific_thread_local_data& get_scheduling_group_specific_threa
  * @return A reference of type T& to the data.
  *
  * @note The parameter T has to be given since there is no way to deduce it.
+ *       May throw std::invalid_argument if sg does not exist or is uninitialized.
  */
 template<typename T>
 T& scheduling_group_get_specific(scheduling_group sg, scheduling_group_key key) {
-    auto& data = internal::get_scheduling_group_specific_thread_local_data();
-#ifdef SEASTAR_DEBUG
-    assert(std::type_index(typeid(T)) == data.scheduling_group_key_configs[key.id()].type_index);
-#endif
-    auto sg_id = internal::scheduling_group_index(sg);
-    if (!data.per_scheduling_group_data[sg_id].queue_is_initialized) {
+    T* p = internal::scheduling_group_get_specific_ptr<T>(sg, std::move(key));
+    if (!p) {
         internal::no_such_scheduling_group(sg);
     }
-    return *reinterpret_cast<T*>(data.per_scheduling_group_data[sg_id].specific_vals[key.id()]);
+    return *p;
 }
 
 /**
@@ -87,11 +107,12 @@ T& scheduling_group_get_specific(scheduling_group sg, scheduling_group_key key) 
  * @note The parameter T has to be given since there is no way to deduce it.
  */
 template<typename T>
-T& scheduling_group_get_specific(scheduling_group_key key) {
+T& scheduling_group_get_specific(scheduling_group_key key) noexcept {
+    // Unlike internal::scheduling_group_get_specific_ptr, this can
+    // return a reference to an element whose queue_is_initialized is
+    // false.
     auto& data = internal::get_scheduling_group_specific_thread_local_data();
-#ifdef SEASTAR_DEBUG
     assert(std::type_index(typeid(T)) == data.scheduling_group_key_configs[key.id()].type_index);
-#endif
     auto sg_id = internal::scheduling_group_index(current_scheduling_group());
     return *reinterpret_cast<T*>(data.per_scheduling_group_data[sg_id].specific_vals[key.id()]);
 }

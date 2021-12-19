@@ -29,11 +29,17 @@
 #include <seastar/core/file.hh>
 #include <seastar/core/seastar.hh>
 #include <seastar/core/print.hh>
+#include <seastar/core/loop.hh>
 #include <seastar/util/tmp_file.hh>
 #include <seastar/util/file.hh>
 
 using namespace seastar;
-namespace fs = compat::filesystem;
+namespace fs = std::filesystem;
+
+class expected_exception : std::runtime_error {
+public:
+    expected_exception() : runtime_error("expected") {}
+};
 
 SEASTAR_TEST_CASE(test_make_tmp_file) {
     return make_tmp_file().then([] (tmp_file tf) {
@@ -149,7 +155,7 @@ SEASTAR_THREAD_TEST_CASE(test_recursive_remove_directory) {
     auto& eng = testing::local_random_engine;
     auto dist = std::uniform_int_distribution<unsigned>();
     int levels = 1 + dist(eng) % 3;
-    test_dir root = { nullptr, default_tmpdir() };
+    test_dir root = { nullptr, default_tmpdir().native() };
     test_dir base = { &root, format("base-{}", dist(eng)) };
     base.random_fill(0, levels, dist, eng);
     base.populate().get();
@@ -229,5 +235,79 @@ SEASTAR_TEST_CASE(tmp_dir_with_leftovers_test) {
         fs::path path = td.get_path() / "testfile.tmp";
         touch_file(path.native()).get();
         BOOST_REQUIRE(file_exists(path.native()).get0());
+    });
+}
+
+SEASTAR_TEST_CASE(tmp_dir_do_with_fail_func_test) {
+    return tmp_dir::do_with_thread([] (tmp_dir& outer) {
+        BOOST_REQUIRE_THROW(tmp_dir::do_with([] (tmp_dir& inner) mutable {
+            return make_exception_future<>(expected_exception());
+        }).get(), expected_exception);
+    });
+}
+
+SEASTAR_TEST_CASE(tmp_dir_do_with_fail_remove_test) {
+    return tmp_dir::do_with_thread([] (tmp_dir& outer) {
+        auto saved_default_tmpdir = default_tmpdir();
+        sstring outer_path = outer.get_path().native();
+        sstring inner_path;
+        sstring inner_path_renamed;
+        set_default_tmpdir(outer_path.c_str());
+        BOOST_REQUIRE_THROW(tmp_dir::do_with([&] (tmp_dir& inner) mutable {
+            inner_path = inner.get_path().native();
+            inner_path_renamed = inner_path + ".renamed";
+            return rename_file(inner_path, inner_path_renamed);
+        }).get(), std::system_error);
+        BOOST_REQUIRE(!file_exists(inner_path).get0());
+        BOOST_REQUIRE(file_exists(inner_path_renamed).get0());
+        set_default_tmpdir(saved_default_tmpdir.c_str());
+    });
+}
+
+SEASTAR_TEST_CASE(tmp_dir_do_with_thread_fail_func_test) {
+    return tmp_dir::do_with_thread([] (tmp_dir& outer) {
+        BOOST_REQUIRE_THROW(tmp_dir::do_with_thread([] (tmp_dir& inner) mutable {
+            throw expected_exception();
+        }).get(), expected_exception);
+    });
+}
+
+SEASTAR_TEST_CASE(tmp_dir_do_with_thread_fail_remove_test) {
+    return tmp_dir::do_with_thread([] (tmp_dir& outer) {
+        auto saved_default_tmpdir = default_tmpdir();
+        sstring outer_path = outer.get_path().native();
+        sstring inner_path;
+        sstring inner_path_renamed;
+        set_default_tmpdir(outer_path.c_str());
+        BOOST_REQUIRE_THROW(tmp_dir::do_with_thread([&] (tmp_dir& inner) mutable {
+            inner_path = inner.get_path().native();
+            inner_path_renamed = inner_path + ".renamed";
+            return rename_file(inner_path, inner_path_renamed);
+        }).get(), std::system_error);
+        BOOST_REQUIRE(!file_exists(inner_path).get0());
+        BOOST_REQUIRE(file_exists(inner_path_renamed).get0());
+        set_default_tmpdir(saved_default_tmpdir.c_str());
+    });
+}
+
+SEASTAR_TEST_CASE(test_read_entire_file_contiguous) {
+    return tmp_file::do_with([] (tmp_file& tf) {
+        return async([&tf] {
+            file& f = tf.get_file();
+            auto& eng = testing::local_random_engine;
+            auto dist = std::uniform_int_distribution<unsigned>();
+            size_t size = f.memory_dma_alignment() * (1 + dist(eng) % 1000);
+            auto wbuf = temporary_buffer<char>::aligned(f.memory_dma_alignment(), size);
+            for (size_t i = 0; i < size; i++) {
+                static char chars[] = "abcdefghijklmnopqrstuvwxyz0123456789";
+                wbuf.get_write()[i] = chars[dist(eng) % sizeof(chars)];
+            }
+
+            BOOST_REQUIRE_EQUAL(f.dma_write(0, wbuf.begin(), wbuf.size()).get0(), wbuf.size());
+            f.flush().get();
+
+            sstring res = util::read_entire_file_contiguous(tf.get_path()).get0();
+            BOOST_REQUIRE_EQUAL(res, std::string_view(wbuf.begin(), wbuf.size()));
+        });
     });
 }

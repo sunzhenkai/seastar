@@ -31,7 +31,7 @@
 
 namespace seastar {
 
-namespace fs = compat::filesystem;
+namespace fs = std::filesystem;
 
 static constexpr const char* default_tmp_name_template = "XXXXXX.tmp";
 
@@ -60,15 +60,18 @@ generate_tmp_name(const fs::path& path_template) {
     return parent;
 }
 
-const char* default_tmpdir() {
-    static const char* default_tmpdir = nullptr;
-    if (!default_tmpdir) {
-        default_tmpdir = getenv("TMPDIR");
-        if (!default_tmpdir) {
-            default_tmpdir = "/tmp";
-        }
+static fs::path default_tmpdir_path;
+
+const fs::path& default_tmpdir() {
+    if (default_tmpdir_path.empty()) {
+        auto TMPDIR = getenv("TMPDIR");
+        default_tmpdir_path = TMPDIR ? TMPDIR : "/tmp";
     }
-    return default_tmpdir;
+    return default_tmpdir_path;
+}
+
+void set_default_tmpdir(fs::path path) {
+    default_tmpdir_path = std::move(path);
 }
 
 tmp_file::tmp_file(tmp_file&& x) noexcept
@@ -91,7 +94,7 @@ future<> tmp_file::open(fs::path path_template, open_flags oflags, file_open_opt
     try {
         path = generate_tmp_name(std::move(path_template));
     } catch (...) {
-        return internal::current_exception_as_future();
+        return current_exception_as_future();
     }
     return open_file_dma(path.native(), oflags, std::move(options)).then([this, path = std::move(path)] (file f) mutable {
         _path = std::move(path);
@@ -138,7 +141,7 @@ future<> tmp_dir::create(fs::path path_template, file_permissions create_permiss
     try {
         path = generate_tmp_name(std::move(path_template));
     } catch (...) {
-        return internal::current_exception_as_future();
+        return current_exception_as_future();
     }
     return touch_directory(path.native(), create_permissions).then([this, path = std::move(path)] () mutable {
         _path = std::move(path);
@@ -153,7 +156,7 @@ future<> tmp_dir::remove() noexcept {
     return recursive_remove_directory(std::move(_path));
 }
 
-future<tmp_dir> make_tmp_dir(compat::filesystem::path path_template, file_permissions create_permissions) noexcept {
+future<tmp_dir> make_tmp_dir(std::filesystem::path path_template, file_permissions create_permissions) noexcept {
     return do_with(tmp_dir(), [path_template = std::move(path_template), create_permissions] (tmp_dir& t) mutable {
         return t.create(std::move(path_template), create_permissions).then([&t] () mutable {
             return make_ready_future<tmp_dir>(std::move(t));

@@ -23,29 +23,22 @@
 
 #include <seastar/core/future.hh>
 
-#if __cplusplus > 201703L
-#include <version>
-#endif
-
-#if !defined(__cpp_lib_coroutine) && !defined(SEASTAR_COROUTINES_TS)
+#ifndef SEASTAR_COROUTINES_ENABLED
 #error Coroutines support disabled.
 #endif
 
 #include <seastar/core/std-coroutine.hh>
+#include <seastar/coroutine/exception.hh>
 
-#ifdef SEASTAR_COROUTINES_TS
-#define SEASTAR_INTERNAL_COROUTINE_NAMESPACE std::experimental
-#else
-#define SEASTAR_INTERNAL_COROUTINE_NAMESPACE std
-#endif
+namespace seastar {
 
-namespace SEASTAR_INTERNAL_COROUTINE_NAMESPACE {
+namespace internal {
 
-template<typename... T, typename... Args>
-class coroutine_traits<seastar::future<T...>, Args...> {
+template <typename T = void>
+class coroutine_traits_base {
 public:
     class promise_type final : public seastar::task {
-        seastar::promise<T...> _promise;
+        seastar::promise<T> _promise;
     public:
         promise_type() = default;
         promise_type(promise_type&&) = delete;
@@ -55,26 +48,38 @@ public:
         void return_value(U&&... value) {
             _promise.set_value(std::forward<U>(value)...);
         }
+
+        void return_value(coroutine::exception ce) noexcept {
+            _promise.set_exception(std::move(ce.eptr));
+        }
+
+        [[deprecated("Forwarding coroutine returns are deprecated as too dangerous. Use 'co_return co_await ...' until explicit syntax is available.")]]
+        void return_value(future<T>&& fut) noexcept {
+            fut.forward_to(std::move(_promise));
+        }
+
         void unhandled_exception() noexcept {
             _promise.set_exception(std::current_exception());
         }
 
-        seastar::future<T...> get_return_object() noexcept {
+        seastar::future<T> get_return_object() noexcept {
             return _promise.get_future();
         }
 
-        suspend_never initial_suspend() noexcept { return { }; }
-        suspend_never final_suspend() noexcept { return { }; }
+        SEASTAR_INTERNAL_COROUTINE_NAMESPACE::suspend_never initial_suspend() noexcept { return { }; }
+        SEASTAR_INTERNAL_COROUTINE_NAMESPACE::suspend_never final_suspend() noexcept { return { }; }
 
         virtual void run_and_dispose() noexcept override {
             auto handle = SEASTAR_INTERNAL_COROUTINE_NAMESPACE::coroutine_handle<promise_type>::from_promise(*this);
             handle.resume();
         }
+
+        task* waiting_task() noexcept override { return _promise.waiting_task(); }
     };
 };
 
-template<typename... Args>
-class coroutine_traits<seastar::future<>, Args...> {
+template <>
+class coroutine_traits_base<> {
 public:
    class promise_type final : public seastar::task {
         seastar::promise<> _promise;
@@ -86,6 +91,7 @@ public:
         void return_void() noexcept {
             _promise.set_value();
         }
+
         void unhandled_exception() noexcept {
             _promise.set_exception(std::current_exception());
         }
@@ -94,21 +100,17 @@ public:
             return _promise.get_future();
         }
 
-        suspend_never initial_suspend() noexcept { return { }; }
-        suspend_never final_suspend() noexcept { return { }; }
+        SEASTAR_INTERNAL_COROUTINE_NAMESPACE::suspend_never initial_suspend() noexcept { return { }; }
+        SEASTAR_INTERNAL_COROUTINE_NAMESPACE::suspend_never final_suspend() noexcept { return { }; }
 
         virtual void run_and_dispose() noexcept override {
             auto handle = SEASTAR_INTERNAL_COROUTINE_NAMESPACE::coroutine_handle<promise_type>::from_promise(*this);
             handle.resume();
         }
+
+       task* waiting_task() noexcept override { return _promise.waiting_task(); }
     };
 };
-
-}
-
-namespace seastar {
-
-namespace internal {
 
 template<typename... T>
 struct awaiter {
@@ -120,12 +122,16 @@ public:
     awaiter(awaiter&&) = delete;
 
     bool await_ready() const noexcept {
-        return _future.available();
+        return _future.available() && !need_preempt();
     }
 
     template<typename U>
     void await_suspend(SEASTAR_INTERNAL_COROUTINE_NAMESPACE::coroutine_handle<U> hndl) noexcept {
-        _future.set_coroutine(hndl.promise());
+        if (!_future.available()) {
+            _future.set_coroutine(hndl.promise());
+        } else {
+            schedule(&hndl.promise());
+        }
     }
 
     std::tuple<T...> await_resume() { return _future.get(); }
@@ -141,12 +147,16 @@ public:
     awaiter(awaiter&&) = delete;
 
     bool await_ready() const noexcept {
-        return _future.available();
+        return _future.available() && !need_preempt();
     }
 
     template<typename U>
     void await_suspend(SEASTAR_INTERNAL_COROUTINE_NAMESPACE::coroutine_handle<U> hndl) noexcept {
-        _future.set_coroutine(hndl.promise());
+        if (!_future.available()) {
+            _future.set_coroutine(hndl.promise());
+        } else {
+            schedule(&hndl.promise());
+        }
     }
 
     T await_resume() { return _future.get0(); }
@@ -162,22 +172,36 @@ public:
     awaiter(awaiter&&) = delete;
 
     bool await_ready() const noexcept {
-        return _future.available();
+        return _future.available() && !need_preempt();
     }
 
     template<typename U>
     void await_suspend(SEASTAR_INTERNAL_COROUTINE_NAMESPACE::coroutine_handle<U> hndl) noexcept {
-        _future.set_coroutine(hndl.promise());
+        if (!_future.available()) {
+            _future.set_coroutine(hndl.promise());
+        } else {
+            schedule(&hndl.promise());
+        }
     }
 
     void await_resume() { _future.get(); }
 };
 
-}
+} // seastar::internal
 
 template<typename... T>
 auto operator co_await(future<T...> f) noexcept {
     return internal::awaiter<T...>(std::move(f));
 }
 
-}
+} // seastar
+
+
+namespace SEASTAR_INTERNAL_COROUTINE_NAMESPACE {
+
+template<typename... T, typename... Args>
+class coroutine_traits<seastar::future<T...>, Args...> : public seastar::internal::coroutine_traits_base<T...> {
+};
+
+} // SEASTAR_INTERNAL_COROUTINE_NAMESPACE
+

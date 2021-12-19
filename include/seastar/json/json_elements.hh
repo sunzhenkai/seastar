@@ -25,6 +25,8 @@
 #include <vector>
 #include <time.h>
 #include <sstream>
+#include <seastar/core/do_with.hh>
+#include <seastar/core/loop.hh>
 #include <seastar/json/formatter.hh>
 #include <seastar/core/sstring.hh>
 #include <seastar/core/iostream.hh>
@@ -46,7 +48,7 @@ public:
     /**
      * The constructors
      */
-    json_base_element()
+    json_base_element() noexcept
             : _mandatory(false), _set(false) {
     }
 
@@ -58,11 +60,11 @@ public:
      * @return true if this is not a mandatory parameter
      * or if it is and it's value is set
      */
-    virtual bool is_verify() {
+    virtual bool is_verify() noexcept {
         return !(_mandatory && !_set);
     }
 
-    json_base_element& operator=(const json_base_element& o) {
+    json_base_element& operator=(const json_base_element& o) noexcept {
         // Names and mandatory are never changed after creation
         _set = o._set;
         return *this;
@@ -118,7 +120,7 @@ public:
      * The brackets operator
      * @return the value
      */
-    const T& operator()() const {
+    const T& operator()() const noexcept {
         return _value;
     }
 
@@ -299,6 +301,9 @@ struct json_return_type {
         _body_writer = std::move(o._body_writer);
         return *this;
     }
+
+    json_return_type(const json_return_type&) = default;
+    json_return_type& operator=(const json_return_type&) = default;
 };
 
 /*!

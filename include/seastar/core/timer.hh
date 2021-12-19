@@ -36,7 +36,7 @@
 /// Seastar provides timers that can be defined to run a callback at a certain
 /// time point in the future; timers are provided for \ref lowres_clock (10ms
 /// resolution, efficient), for std::chrono::steady_clock (accurate but less
-/// efficient) and for \ref manual_clock_type (for testing purposes).
+/// efficient) and for \ref manual_clock (for testing purposes).
 ///
 /// Timers are optimized for cancellation; that is, adding a timer and cancelling
 /// it is very efficient. This means that attaching a timer per object for
@@ -86,12 +86,12 @@ private:
     scheduling_group _sg;
     callback_t _callback;
     time_point _expiry;
-    compat::optional<duration> _period;
+    std::optional<duration> _period;
     bool _armed = false;
     bool _queued = false;
     bool _expired = false;
-    void readd_periodic();
-    void arm_state(time_point until, compat::optional<duration> period) {
+    void readd_periodic() noexcept;
+    void arm_state(time_point until, std::optional<duration> period) noexcept {
         assert(!_armed);
         _period = period;
         _armed = true;
@@ -101,7 +101,8 @@ private:
     }
 public:
     /// Constructs a timer with no callback set and no expiration time.
-    timer() = default;
+    timer() noexcept {};  // implementation is required (instead of = default) for noexcept due to a bug in gcc 9.3.1,
+                          // since boost::intrusive::list_member_hook default constructor is not specified as noexcept.
     /// Constructs a timer from another timer that is moved from.
     ///
     /// \note care should be taken when moving a timer whose callback captures `this`,
@@ -116,12 +117,12 @@ public:
     ///
     /// \param sg Scheduling group to run the callback under.
     /// \param callback function (with signature `void ()`) to execute after the timer is armed and expired.
-    timer(scheduling_group sg, noncopyable_function<void ()>&& callback) : _sg(sg), _callback{std::move(callback)} {
+    timer(scheduling_group sg, noncopyable_function<void ()>&& callback) noexcept : _sg(sg), _callback{std::move(callback)} {
     }
     /// Constructs a timer with a callback. The timer is not armed.
     ///
     /// \param callback function (with signature `void ()`) to execute after the timer is armed and expired.
-    explicit timer(noncopyable_function<void ()>&& callback) : timer(current_scheduling_group(), std::move(callback)) {
+    explicit timer(noncopyable_function<void ()>&& callback) noexcept : timer(current_scheduling_group(), std::move(callback)) {
     }
     /// Destroys the timer. The timer is cancelled if armed.
     ~timer();
@@ -129,14 +130,14 @@ public:
     ///
     /// \param sg the scheduling group under which the callback will be executed.
     /// \param callback the callback to be executed when the timer expires.
-    void set_callback(scheduling_group sg, noncopyable_function<void ()>&& callback) {
+    void set_callback(scheduling_group sg, noncopyable_function<void ()>&& callback) noexcept {
         _sg = sg;
         _callback = std::move(callback);
     }
     /// Sets the callback function to be called when the timer expires.
     ///
     /// \param callback the callback to be executed when the timer expires.
-    void set_callback(noncopyable_function<void ()>&& callback) {
+    void set_callback(noncopyable_function<void ()>&& callback) noexcept {
         set_callback(current_scheduling_group(), std::move(callback));
     }
     /// Sets the timer expiration time.
@@ -150,7 +151,7 @@ public:
     /// \param period optional automatic rearm duration; if given the timer
     ///        will automatically rearm itself when it expires, using the period
     ///        to calculate the next expiration time.
-    void arm(time_point until, compat::optional<duration> period = {});
+    void arm(time_point until, std::optional<duration> period = {}) noexcept;
     /// Sets the timer expiration time. If the timer was already armed, it is
     /// canceled first.
     ///
@@ -158,7 +159,7 @@ public:
     /// \param period optional automatic rearm duration; if given the timer
     ///        will automatically rearm itself when it expires, using the period
     ///        to calculate the next expiration time.
-    void rearm(time_point until, compat::optional<duration> period = {}) {
+    void rearm(time_point until, std::optional<duration> period = {}) noexcept {
         if (_armed) {
             cancel();
         }
@@ -172,32 +173,43 @@ public:
     /// rearm().
     ///
     /// \param delta the time when the timer expires, relative to now
-    void arm(duration delta) {
+    void arm(duration delta) noexcept {
         return arm(Clock::now() + delta);
     }
     /// Sets the timer expiration time, with automatic rearming
     ///
     /// \param delta the time when the timer expires, relative to now. The timer
     ///        will also rearm automatically using the same delta time.
-    void arm_periodic(duration delta) {
+    void arm_periodic(duration delta) noexcept {
         arm(Clock::now() + delta, {delta});
+    }
+    /// Sets the timer expiration time, with automatic rearming.
+    /// If the timer was already armed, it is canceled first.
+    ///
+    /// \param delta the time when the timer expires, relative to now. The timer
+    ///        will also rearm automatically using the same delta time.
+    void rearm_periodic(duration delta) noexcept {
+        if (_armed) {
+            cancel();
+        }
+        arm_periodic(delta);
     }
     /// Returns whether the timer is armed
     ///
     /// \return `true` if the timer is armed and has not expired yet.
-    bool armed() const { return _armed; }
+    bool armed() const noexcept { return _armed; }
     /// Cancels an armed timer.
     ///
     /// If the timer was armed, it is disarmed. If the timer was not
     /// armed, does nothing.
     ///
     /// \return `true` if the timer was armed before the call.
-    bool cancel();
+    bool cancel() noexcept;
     /// Gets the expiration time of an armed timer.
     ///
     /// \return the time at which the timer is scheduled to expire (undefined if the
     ///       timer is not armed).
-    time_point get_timeout() {
+    time_point get_timeout() const noexcept {
         return _expiry;
     }
     friend class reactor;

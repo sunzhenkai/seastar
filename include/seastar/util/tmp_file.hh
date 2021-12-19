@@ -24,21 +24,22 @@
 
 #include <seastar/core/future.hh>
 #include <seastar/core/file.hh>
+#include <seastar/core/thread.hh>
 #include <seastar/util/std-compat.hh>
-#include <seastar/util/defer.hh>
 
 namespace seastar {
 
-const char* default_tmpdir();
+const std::filesystem::path& default_tmpdir();
+void set_default_tmpdir(std::filesystem::path);
 
 class tmp_file {
-    compat::filesystem::path _path;
+    std::filesystem::path _path;
     file _file;
     bool _is_open = false;
 
-    static_assert(std::is_nothrow_constructible<compat::filesystem::path>::value,
+    static_assert(std::is_nothrow_constructible<std::filesystem::path>::value,
         "filesystem::path's constructor must not throw");
-    static_assert(std::is_nothrow_move_constructible<compat::filesystem::path>::value,
+    static_assert(std::is_nothrow_move_constructible<std::filesystem::path>::value,
         "filesystem::path's move constructor must not throw");
 public:
     tmp_file() noexcept = default;
@@ -49,14 +50,14 @@ public:
 
     ~tmp_file();
 
-    future<> open(compat::filesystem::path path_template = default_tmpdir(),
+    future<> open(std::filesystem::path path_template = default_tmpdir(),
             open_flags oflags = open_flags::rw,
             file_open_options options = {}) noexcept;
     future<> close() noexcept;
     future<> remove() noexcept;
 
     template <typename Func>
-    static future<> do_with(compat::filesystem::path path_template, Func&& func,
+    static future<> do_with(std::filesystem::path path_template, Func&& func,
             open_flags oflags = open_flags::rw,
             file_open_options options = {}) noexcept {
         static_assert(std::is_nothrow_move_constructible<Func>::value,
@@ -85,7 +86,7 @@ public:
         return _is_open;
     }
 
-    const compat::filesystem::path& get_path() const {
+    const std::filesystem::path& get_path() const {
         return _path;
     }
 
@@ -98,8 +99,8 @@ public:
 ///
 /// \param path_template - path where the file is to be created,
 ///                        optionally including a template for the file name.
-/// \param open_flags - optional open flags (open_flags::create | open_flags::exclusive are added to those by default)
-/// \param file_open_options - additional options, e.g. for setting the created file permission.
+/// \param oflags - optional \ref open_flags (open_flags::create | open_flags::exclusive are added to those by default)
+/// \param options - additional \ref file_open_options, e.g. for setting the created file permission.
 ///
 /// \note
 ///    path_template may optionally include a filename template in the last component of the path.
@@ -112,11 +113,11 @@ public:
 ///
 ///    The parent directory must exist and be writable to the current process.
 ///
-future<tmp_file> make_tmp_file(compat::filesystem::path path_template = default_tmpdir(),
+future<tmp_file> make_tmp_file(std::filesystem::path path_template = default_tmpdir(),
         open_flags oflags = open_flags::rw, file_open_options options = {}) noexcept;
 
 class tmp_dir {
-    compat::filesystem::path _path;
+    std::filesystem::path _path;
 
 public:
     tmp_dir() = default;
@@ -127,14 +128,15 @@ public:
 
     ~tmp_dir();
 
-    future<> create(compat::filesystem::path path_template = default_tmpdir(),
+    future<> create(std::filesystem::path path_template = default_tmpdir(),
             file_permissions create_permissions = file_permissions::default_dir_permissions) noexcept;
     future<> remove() noexcept;
 
     template <typename Func>
-    static future<> do_with(compat::filesystem::path path_template, Func&& func,
+    SEASTAR_CONCEPT( requires std::is_nothrow_move_constructible_v<Func> )
+    static future<> do_with(std::filesystem::path path_template, Func&& func,
             file_permissions create_permissions = file_permissions::default_dir_permissions) noexcept {
-        static_assert(std::is_nothrow_move_constructible<Func>::value,
+        static_assert(std::is_nothrow_move_constructible_v<Func>,
             "Func's move constructor must not throw");
         return seastar::do_with(tmp_dir(), [func = std::move(func), path_template = std::move(path_template), create_permissions] (tmp_dir& t) mutable {
             return t.create(std::move(path_template), create_permissions).then([&t, func = std::move(func)] () mutable {
@@ -151,12 +153,17 @@ public:
     }
 
     template <typename Func>
-    static future<> do_with_thread(Func&& func) {
+
+    SEASTAR_CONCEPT( requires std::is_nothrow_move_constructible_v<Func> )
+    static future<> do_with_thread(Func&& func) noexcept {
+        static_assert(std::is_nothrow_move_constructible_v<Func>,
+            "Func's move constructor must not throw");
         return async([func = std::move(func)] () mutable {
             auto t = tmp_dir();
             t.create().get();
-            auto remove_on_exit = defer([&t] { t.remove().get(); });
-            func(t);
+            futurize_invoke(func, t).finally([&t] {
+                return t.remove();
+            }).get();
         });
     }
 
@@ -164,7 +171,7 @@ public:
         return !_path.empty();
     }
 
-    const compat::filesystem::path& get_path() const {
+    const std::filesystem::path& get_path() const {
         return _path;
     }
 };
@@ -186,7 +193,7 @@ public:
 ///
 ///    The parent directory must exist and be writable to the current process.
 ///
-future<tmp_dir> make_tmp_dir(compat::filesystem::path path_template = default_tmpdir(),
+future<tmp_dir> make_tmp_dir(std::filesystem::path path_template = default_tmpdir(),
         file_permissions create_permissions = file_permissions::default_dir_permissions) noexcept;
 
 } // namespace seastar

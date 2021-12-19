@@ -75,7 +75,7 @@ seastar_test::seastar_test() {
 
 namespace exception_predicate {
 
-std::function<bool(const std::exception&)> message_equals(compat::string_view expected_message) {
+std::function<bool(const std::exception&)> message_equals(std::string_view expected_message) {
     return [expected_message] (const std::exception& e) {
         std::string error = e.what();
         if (error == expected_message) {
@@ -87,7 +87,7 @@ std::function<bool(const std::exception&)> message_equals(compat::string_view ex
     };
 }
 
-std::function<bool(const std::exception&)> message_contains(compat::string_view expected_message) {
+std::function<bool(const std::exception&)> message_contains(std::string_view expected_message) {
     return [expected_message] (const std::exception& e) {
         std::string error = e.what();
         if (error.find(expected_message.data()) != std::string::npos) {
@@ -101,12 +101,13 @@ std::function<bool(const std::exception&)> message_contains(compat::string_view 
 
 } // exception_predicate
 
-scoped_no_abort_on_internal_error::scoped_no_abort_on_internal_error() {
-    set_abort_on_internal_error(false);
+scoped_no_abort_on_internal_error::scoped_no_abort_on_internal_error() noexcept
+    : _prev(set_abort_on_internal_error(false))
+{
 }
 
 scoped_no_abort_on_internal_error::~scoped_no_abort_on_internal_error() {
-    set_abort_on_internal_error(true);
+    set_abort_on_internal_error(_prev);
 }
 
 }

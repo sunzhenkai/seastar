@@ -31,10 +31,10 @@
 #include "../../src/core/fsnotify.hh"
 #include "tmpdir.hh"
 
-namespace fs = seastar::compat::filesystem;
+namespace fs = std::filesystem;
 using namespace seastar;
 
-static bool find_event(const std::vector<fsnotifier::event>& events, const fsnotifier::watch& w, fsnotifier::flags mask, compat::optional<sstring> path = {}) {
+static bool find_event(const std::vector<fsnotifier::event>& events, const fsnotifier::watch& w, fsnotifier::flags mask, std::optional<sstring> path = {}) {
     auto i = std::find_if(events.begin(), events.end(), [&](const fsnotifier::event& e) {
         return (e.mask & mask) != fsnotifier::flags{}
             && e.id == w
@@ -55,7 +55,7 @@ SEASTAR_THREAD_TEST_CASE(test_notify_modify_close_delete) {
         | fsnotifier::flags::close
     ).get0();
 
-    auto os = make_file_output_stream(f);
+    auto os = api_v3::and_newer::make_file_output_stream(f).get0();
     os.write("kossa").get();
     os.flush().get();
 
@@ -88,7 +88,7 @@ SEASTAR_THREAD_TEST_CASE(test_notify_overwrite) {
 
     auto write_file = [](fs::path& p, sstring content) {
         auto f = open_file_dma(p.native(), open_flags::create|open_flags::rw).get0();
-        auto os = make_file_output_stream(f);
+        auto os = api_v3::and_newer::make_file_output_stream(f).get0();
         os.write(content).get();
         os.flush().get();
         os.close().get();

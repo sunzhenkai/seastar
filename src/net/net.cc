@@ -32,8 +32,16 @@
 
 namespace seastar {
 
+static_assert(std::is_nothrow_default_constructible_v<ipv4_addr>);
+static_assert(std::is_nothrow_copy_constructible_v<ipv4_addr>);
+static_assert(std::is_nothrow_move_constructible_v<ipv4_addr>);
+
+static_assert(std::is_nothrow_default_constructible_v<ipv6_addr>);
+static_assert(std::is_nothrow_copy_constructible_v<ipv6_addr>);
+static_assert(std::is_nothrow_move_constructible_v<ipv6_addr>);
+
 std::ostream& operator<<(std::ostream &os, ipv4_addr addr) {
-    fmt_print(os, "{:d}.{:d}.{:d}.{:d}",
+    fmt::print(os, "{:d}.{:d}.{:d}.{:d}",
             (addr.ip >> 24) & 0xff,
             (addr.ip >> 16) & 0xff,
             (addr.ip >> 8) & 0xff,
@@ -63,11 +71,11 @@ ipv4_addr::ipv4_addr(const net::inet_address& a, uint16_t port)
     : ipv4_addr(::in_addr(a), port)
 {}
 
-ipv4_addr::ipv4_addr(const socket_address &sa)
+ipv4_addr::ipv4_addr(const socket_address &sa) noexcept
     : ipv4_addr(sa.addr(), sa.port())
 {}
 
-ipv4_addr::ipv4_addr(const ::in_addr& in, uint16_t p)
+ipv4_addr::ipv4_addr(const ::in_addr& in, uint16_t p) noexcept
     : ip(net::ntoh(in.s_addr)), port(p)
 {}
 
@@ -197,7 +205,7 @@ void qp::configure_proxies(const std::map<unsigned, float>& cpu_weights) {
         return;
     }
     register_packet_provider([this] {
-        compat::optional<packet> p;
+        std::optional<packet> p;
         if (!_proxy_packetq.empty()) {
             p = std::move(_proxy_packetq.front());
             _proxy_packetq.pop_front();
@@ -260,7 +268,7 @@ interface::interface(std::shared_ptr<device> dev)
         return dispatch_packet(std::move(p));
     });
     dev->local_queue().register_packet_provider([this, idx = 0u] () mutable {
-            compat::optional<packet> p;
+            std::optional<packet> p;
             for (size_t i = 0; i < _pkt_providers.size(); i++) {
                 auto l3p = _pkt_providers[idx++]();
                 if (idx == _pkt_providers.size())

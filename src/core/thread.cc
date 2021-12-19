@@ -22,6 +22,7 @@
 
 #include <seastar/core/thread.hh>
 #include <seastar/core/posix.hh>
+#include <seastar/core/reactor.hh>
 #include <ucontext.h>
 #include <algorithm>
 
@@ -152,7 +153,7 @@ inline void jmp_buf_link::final_switch_out()
 
 // Both asan and optimizations can increase the stack used by a
 // function. When both are used, we need more than 128 KiB.
-#if defined(__OPTIMIZE__) && defined(SEASTAR_ASAN_ENABLED)
+#if defined(SEASTAR_ASAN_ENABLED)
 static constexpr size_t base_stack_size = 256 * 1024;
 #else
 static constexpr size_t base_stack_size = 128 * 1024;
@@ -236,6 +237,7 @@ thread_context::setup(size_t stack_size) {
 
 void
 thread_context::switch_in() {
+    local_engine->_current_task = nullptr; // thread_wake_task is on the stack and will be invalid when we resume
     _context.switch_in();
 }
 
@@ -284,6 +286,8 @@ thread_context::main() {
     asm(".cfi_undefined lr");
 #elif defined(__aarch64__)
     asm(".cfi_undefined x30");
+#elif defined(__s390x__)
+    asm(".cfi_undefined r14");
 #else
     #warning "Backtracing from seastar threads may be broken"
 #endif

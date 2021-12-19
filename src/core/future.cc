@@ -21,6 +21,7 @@
 
 #include <seastar/core/future.hh>
 #include <seastar/core/reactor.hh>
+#include <seastar/core/thread.hh>
 #include <seastar/core/report_exception.hh>
 #include <seastar/util/backtrace.hh>
 
@@ -28,11 +29,17 @@ namespace seastar {
 
 // We can't test future_state_base directly because its private
 // destructor is protected.
-static_assert(std::is_nothrow_move_constructible<future_state<int>>::value,
+static_assert(std::is_nothrow_move_constructible<future_state<std::tuple<int>>>::value,
               "future_state's move constructor must not throw");
 
-static_assert(sizeof(future_state<>) <= 8, "future_state<> is too large");
-static_assert(sizeof(future_state<long>) <= 16, "future_state<long> is too large");
+static_assert(sizeof(future_state<std::tuple<>>) <= 8, "future_state<std::tuple<>> is too large");
+static_assert(sizeof(future_state<std::tuple<long>>) <= 16, "future_state<std::tuple<long>> is too large");
+static_assert(future_state<std::tuple<>>::has_trivial_move_and_destroy, "future_state<std::tuple<>> not trivial");
+#if SEASTAR_API_LEVEL < 5
+static_assert(future_state<std::tuple<long>>::has_trivial_move_and_destroy, "future_state<std::tuple<long>> not trivial");
+#else
+static_assert(future_state<long>::has_trivial_move_and_destroy, "future_state<long> not trivial");
+#endif
 
 // We need to be able to move and copy std::exception_ptr in and out
 // of future/promise/continuations without that producing a new
@@ -60,19 +67,31 @@ void promise_base::move_it(promise_base&& x) noexcept {
     }
 }
 
+static void set_to_broken_promise(future_state_base& state) noexcept {
+    try {
+        // Constructing broken_promise may throw (std::logic_error ctor is not noexcept).
+        state.set_exception(std::make_exception_ptr(broken_promise{}));
+    } catch (...) {
+        state.set_exception(std::current_exception());
+    }
+}
+
 promise_base::promise_base(promise_base&& x) noexcept {
     move_it(std::move(x));
 }
 
 void promise_base::clear() noexcept {
+    if (__builtin_expect(bool(_task), false)) {
+        assert(_state && !_state->available());
+        set_to_broken_promise(*_state);
+        ::seastar::schedule(std::exchange(_task, nullptr));
+    }
     if (_future) {
         assert(_state);
-        assert(_state->available() || !_task);
+        if (!_state->available()) {
+            set_to_broken_promise(*_state);
+        }
         _future->detach_promise();
-    } else if (__builtin_expect(bool(_task), false)) {
-        assert(_state && !_state->available());
-        _state->set_to_broken_promise();
-        ::seastar::schedule(std::exchange(_task, nullptr));
     }
 }
 
@@ -89,8 +108,7 @@ void promise_base::set_to_current_exception() noexcept {
 template <promise_base::urgent Urgent>
 void promise_base::make_ready() noexcept {
     if (_task) {
-        _state = nullptr;
-        if (Urgent == urgent::yes && !need_preempt()) {
+        if (Urgent == urgent::yes) {
             ::seastar::schedule_urgent(std::exchange(_task, nullptr));
         } else {
             ::seastar::schedule(std::exchange(_task, nullptr));
@@ -100,10 +118,10 @@ void promise_base::make_ready() noexcept {
 
 template void promise_base::make_ready<promise_base::urgent::no>() noexcept;
 template void promise_base::make_ready<promise_base::urgent::yes>() noexcept;
+}
 
 template
-future<> internal::current_exception_as_future() noexcept;
-}
+future<> current_exception_as_future() noexcept;
 
 /**
  * engine_exit() exits the reactor. It should be given a pointer to the
@@ -121,25 +139,15 @@ void engine_exit(std::exception_ptr eptr) {
 
 broken_promise::broken_promise() : logic_error("broken promise") { }
 
-future_state_base future_state_base::current_exception() noexcept {
-    return future_state_base(std::current_exception());
-}
-
-void future_state_base::set_to_broken_promise() noexcept {
-    try {
-        // Constructing broken_promise may throw (std::logic_error ctor is not noexcept).
-        set_exception(std::make_exception_ptr(broken_promise{}));
-    } catch (...) {
-        set_exception(std::current_exception());
-    }
-}
+future_state_base::future_state_base(current_exception_future_marker) noexcept
+    : future_state_base(std::current_exception()) { }
 
 void future_state_base::ignore() noexcept {
     switch (_u.st) {
     case state::invalid:
     case state::future:
-        assert(0 && "invalid state for ignore");
     case state::result_unavailable:
+        assert(0 && "invalid state for ignore");
     case state::result:
         _u.st = state::result_unavailable;
         break;
@@ -147,6 +155,54 @@ void future_state_base::ignore() noexcept {
         // Ignore the exception
         _u.take_exception();
     }
+}
+
+nested_exception::nested_exception(std::exception_ptr inner, std::exception_ptr outer) noexcept
+    : inner(std::move(inner)), outer(std::move(outer)) {}
+
+nested_exception::nested_exception(nested_exception&&) noexcept = default;
+
+nested_exception::nested_exception(const nested_exception&) noexcept = default;
+
+const char* nested_exception::what() const noexcept {
+    return "seastar::nested_exception";
+}
+
+[[noreturn]] void nested_exception::rethrow_nested() const {
+    std::rethrow_exception(outer);
+}
+
+static std::exception_ptr make_nested(std::exception_ptr&& inner, future_state_base&& old) noexcept {
+    std::exception_ptr outer = std::move(old).get_exception();
+    nested_exception nested{std::move(inner), std::move(outer)};
+    return std::make_exception_ptr<nested_exception>(std::move(nested));
+}
+
+future_state_base::future_state_base(nested_exception_marker, future_state_base&& n, future_state_base&& old) noexcept {
+    std::exception_ptr inner = std::move(n).get_exception();
+    if (!old.failed()) {
+        new (this) future_state_base(std::move(inner));
+    } else {
+        new (this) future_state_base(make_nested(std::move(inner), std::move(old)));
+    }
+}
+
+future_state_base::future_state_base(nested_exception_marker, future_state_base&& old) noexcept {
+    if (!old.failed()) {
+        new (this) future_state_base(current_exception_future_marker());
+        return;
+    } else {
+        new (this) future_state_base(make_nested(std::current_exception(), std::move(old)));
+    }
+}
+
+void future_state_base::rethrow_exception() && {
+    // Move ex out so future::~future() knows we've handled it
+    std::rethrow_exception(std::move(*this).get_exception());
+}
+
+void future_state_base::rethrow_exception() const& {
+    std::rethrow_exception(_u.ex);
 }
 
 void report_failed_future(const std::exception_ptr& eptr) noexcept {
@@ -157,5 +213,50 @@ void report_failed_future(const std::exception_ptr& eptr) noexcept {
 void report_failed_future(const future_state_base& state) noexcept {
     report_failed_future(state._u.ex);
 }
+
+void report_failed_future(future_state_base::any&& state) noexcept {
+    report_failed_future(std::move(state).take_exception());
+}
+
+void with_allow_abandoned_failed_futures(unsigned count, noncopyable_function<void ()> func) {
+    auto before = engine()._abandoned_failed_futures;
+    func();
+    auto after = engine()._abandoned_failed_futures;
+    assert(after - before == count);
+    engine()._abandoned_failed_futures = before;
+}
+
+namespace {
+class thread_wake_task final : public task {
+    thread_context* _thread;
+public:
+    thread_wake_task(thread_context* thread) noexcept : _thread(thread) {}
+    virtual void run_and_dispose() noexcept override {
+        thread_impl::switch_in(_thread);
+        // no need to delete, since this is always allocated on
+        // _thread's stack.
+    }
+    /// Returns the task which is waiting for this thread to be done, or nullptr.
+    virtual task* waiting_task() noexcept override {
+        return _thread->waiting_task();
+    }
+};
+}
+
+void internal::future_base::do_wait() noexcept {
+    auto thread = thread_impl::get();
+    assert(thread);
+    thread_wake_task wake_task{thread};
+    wake_task.make_backtrace();
+    _promise->_task = &wake_task;
+    thread_impl::switch_out(thread);
+}
+
+#ifdef SEASTAR_COROUTINES_ENABLED
+void internal::future_base::set_coroutine(task& coroutine) noexcept {
+    assert(_promise);
+    _promise->_task = &coroutine;
+}
+#endif
 
 }

@@ -50,6 +50,27 @@ SEASTAR_THREAD_TEST_CASE(invoke_on_during_stop_test) {
     s.stop().get();
 }
 
+class peering_counter : public peering_sharded_service<peering_counter> {
+public:
+    future<int> count() const {
+        return container().map_reduce(adder<int>(), [] (auto& pc) { return 1; });
+    }
+
+    future<int> count_from(int base) const {
+        return container().map_reduce0([] (auto& pc) { return 1; }, base, std::plus<int>());
+    }
+};
+
+SEASTAR_THREAD_TEST_CASE(test_const_map_reduces) {
+    sharded<peering_counter> c;
+    c.start().get();
+
+    BOOST_REQUIRE_EQUAL(c.local().count().get0(), smp::count);
+    BOOST_REQUIRE_EQUAL(c.local().count_from(1).get0(), smp::count + 1);
+
+    c.stop().get();
+}
+
 class mydata {
 public:
     int x = 1;
@@ -97,4 +118,14 @@ SEASTAR_THREAD_TEST_CASE(invoke_map_returns_future_value_from_thread) {
         }
     }).get();
     s.stop().get();
+}
+
+SEASTAR_THREAD_TEST_CASE(failed_sharded_start_doesnt_hang) {
+    class fail_to_start {
+    public:
+        fail_to_start() { throw 0; }
+    };
+
+    seastar::sharded<fail_to_start> s;
+    s.start().then_wrapped([] (auto&& fut) { fut.ignore_ready_future(); }).get();
 }

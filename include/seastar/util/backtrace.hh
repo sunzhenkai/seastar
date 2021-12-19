@@ -23,10 +23,13 @@
 
 #include <execinfo.h>
 #include <iosfwd>
+#include <variant>
 #include <boost/container/static_vector.hpp>
 
 #include <seastar/core/sstring.hh>
 #include <seastar/core/print.hh>
+#include <seastar/core/scheduling.hh>
+#include <seastar/core/shared_ptr.hh>
 
 namespace seastar {
 
@@ -41,12 +44,12 @@ struct frame {
     uintptr_t addr;
 };
 
-bool operator==(const frame& a, const frame& b);
+bool operator==(const frame& a, const frame& b) noexcept;
 
 
 // If addr doesn't seem to belong to any of the provided shared objects, it
 // will be considered as part of the executable.
-frame decorate(uintptr_t addr);
+frame decorate(uintptr_t addr) noexcept;
 
 // Invokes func for each frame passing it as argument.
 template<typename Func>
@@ -60,23 +63,81 @@ void backtrace(Func&& func) noexcept(noexcept(func(frame()))) {
     }
 }
 
-class saved_backtrace {
+// Represents a call stack of a single thread.
+class simple_backtrace {
 public:
     using vector_type = boost::container::static_vector<frame, 64>;
 private:
     vector_type _frames;
+    size_t _hash;
+    char _delimeter;
+private:
+    size_t calculate_hash() const noexcept;
 public:
-    saved_backtrace() = default;
-    saved_backtrace(vector_type f) : _frames(std::move(f)) {}
-    size_t hash() const;
+    simple_backtrace(char delimeter = ' ') noexcept : _delimeter(delimeter) {}
+    simple_backtrace(vector_type f, char delimeter = ' ') noexcept : _frames(std::move(f)), _delimeter(delimeter) {}
 
-    friend std::ostream& operator<<(std::ostream& out, const saved_backtrace&);
+    size_t hash() const noexcept { return _hash; }
+    char delimeter() const noexcept { return _delimeter; }
 
-    bool operator==(const saved_backtrace& o) const {
-        return _frames == o._frames;
+    friend std::ostream& operator<<(std::ostream& out, const simple_backtrace&);
+
+    bool operator==(const simple_backtrace& o) const noexcept {
+        return _hash == o._hash && _frames == o._frames;
     }
 
-    bool operator!=(const saved_backtrace& o) const {
+    bool operator!=(const simple_backtrace& o) const noexcept {
+        return !(*this == o);
+    }
+};
+
+using shared_backtrace = seastar::lw_shared_ptr<simple_backtrace>;
+
+// Represents a task object inside a tasktrace.
+class task_entry {
+    const std::type_info* _task_type;
+public:
+    task_entry(const std::type_info& ti) noexcept
+        : _task_type(&ti)
+    { }
+
+    friend std::ostream& operator<<(std::ostream& out, const task_entry&);
+
+    bool operator==(const task_entry& o) const noexcept {
+        return *_task_type == *o._task_type;
+    }
+
+    bool operator!=(const task_entry& o) const noexcept {
+        return !(*this == o);
+    }
+
+    size_t hash() const noexcept { return _task_type->hash_code(); }
+};
+
+// Extended backtrace which consists of a backtrace of the currently running task
+// and information about the chain of tasks waiting for the current operation to complete.
+class tasktrace {
+public:
+    using entry = std::variant<shared_backtrace, task_entry>;
+    using vector_type = boost::container::static_vector<entry, 16>;
+private:
+    simple_backtrace _main;
+    vector_type _prev;
+    scheduling_group _sg;
+    size_t _hash;
+public:
+    tasktrace() = default;
+    tasktrace(simple_backtrace main, vector_type prev, size_t prev_hash, scheduling_group sg) noexcept;
+    ~tasktrace();
+
+    size_t hash() const noexcept { return _hash; }
+    char delimeter() const noexcept { return _main.delimeter(); }
+
+    friend std::ostream& operator<<(std::ostream& out, const tasktrace&);
+
+    bool operator==(const tasktrace& o) const noexcept;
+
+    bool operator!=(const tasktrace& o) const noexcept {
         return !(*this == o);
     }
 };
@@ -86,8 +147,15 @@ public:
 namespace std {
 
 template<>
-struct hash<seastar::saved_backtrace> {
-    size_t operator()(const seastar::saved_backtrace& b) const {
+struct hash<seastar::simple_backtrace> {
+    size_t operator()(const seastar::simple_backtrace& b) const {
+        return b.hash();
+    }
+};
+
+template<>
+struct hash<seastar::tasktrace> {
+    size_t operator()(const seastar::tasktrace& b) const {
         return b.hash();
     }
 };
@@ -96,8 +164,16 @@ struct hash<seastar::saved_backtrace> {
 
 namespace seastar {
 
+using saved_backtrace = tasktrace;
+
 saved_backtrace current_backtrace() noexcept;
-std::ostream& operator<<(std::ostream& out, const saved_backtrace& b);
+
+tasktrace current_tasktrace() noexcept;
+
+// Collects backtrace only within the currently executing task.
+simple_backtrace current_backtrace_tasklocal() noexcept;
+
+std::ostream& operator<<(std::ostream& out, const tasktrace& b);
 
 namespace internal {
 

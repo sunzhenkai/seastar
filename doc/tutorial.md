@@ -163,40 +163,10 @@ When the machine is configured as in the example above - two cores with two hype
 We cannot start more threads than the number of hardware threads, as allowing this will be grossly inefficient. Trying it will result in an error:
 ```none
 $ ./a.out -c5
-terminate called after throwing an instance of 'std::runtime_error'
-  what():  insufficient processing units
-abort (core dumped)
+Could not initialize seastar: std::runtime_error (insufficient processing units)
 ```
 
-The error is an exception thrown from app.run, which we did not catch, leading to this ugly uncaught-exception crash. It is better to catch this sort of startup exceptions, and exit gracefully without a core dump:
-
-```cpp
-#include <seastar/core/app-template.hh>
-#include <seastar/core/reactor.hh>
-#include <iostream>
-#include <stdexcept>
-
-int main(int argc, char** argv) {
-    seastar::app_template app;
-    try {
-        app.run(argc, argv, [] {
-            std::cout << seastar::smp::count << "\n";
-            return seastar::make_ready_future<>();
-        });
-    } catch(...) {
-        std::cerr << "Failed to start application: "
-                  << std::current_exception() << "\n";
-        return 1;
-    }
-    return 0;
-}
-```
-```none
-$ ./a.out -c5
-Couldn't start application: std::runtime_error (insufficient processing units)
-```
-
-Note that catching the exceptions this way does **not** catch exceptions thrown in the application's actual asynchronous code. We will discuss these later in this tutorial.
+The error is an exception thrown from app.run, which was caught by seastar itself and turned into a non-zero exit code. Note that catching the exceptions this way does **not** catch exceptions thrown in the application's actual asynchronous code. We will discuss these later in this tutorial.
 
 ## Seastar memory
 As explained in the introduction, Seastar applications shard their memory. Each thread is preallocated with a large piece of memory (on the same NUMA node it is running on), and uses only that memory for its allocations (such as `malloc()` or `new`).
@@ -223,7 +193,7 @@ Examples include:
 
 The type `future<int>` variable holds an int that will eventually be available - at this point might already be available, or might not be available yet. The method available() tests if a value is already available, and the method get() gets the value. The type `future<>` indicates something which will eventually complete, but not return any value.
 
-A future is usually returned by an **asynchronous function**, a function which returns a future and arranges for this future to be eventually resolved.  Because asynchrnous functions _promise_ to eventually resolve the future which they returned, asynchronous functions are sometimes called "promises"; But we will avoid this term because it tends to confuse more than it explains.
+A future is usually returned by an **asynchronous function**, a function which returns a future and arranges for this future to be eventually resolved.  Because asynchronous functions _promise_ to eventually resolve the future which they returned, asynchronous functions are sometimes called "promises"; But we will avoid this term because it tends to confuse more than it explains.
 
 One simple example of an asynchronous function is Seastar's function sleep():
 
@@ -333,14 +303,14 @@ seastar::future<> f() {
 }
 ```
 
-The function `slow()` deserves more explanation. As usual, this function returns a future<int> immediately, and doesn't wait for the sleep to complete, and the code in `f()` can chain a continuation to this future's completion. The future returned by `slow()` is itself a chain of futures: It will become ready once sleep's future becomes ready and then the value 3 is returned. We'll explain below in more details how `then()` returns a future, and how this allows *chaining* futures.
+The function `slow()` deserves more explanation. As usual, this function returns a `future<int>` immediately, and doesn't wait for the sleep to complete, and the code in `f()` can chain a continuation to this future's completion. The future returned by `slow()` is itself a chain of futures: It will become ready once sleep's future becomes ready and then the value 3 is returned. We'll explain below in more details how `then()` returns a future, and how this allows *chaining* futures.
 
-This example begins to show the convenience of the futures programming model, which allows the programmer to neatly encapsulate complex asynchronous operations. slow() might involve a complex asynchronous operation requiring multiple steps, but its user can use it just as easily as a simple sleep(), and Seastar's engine takes care of running the continuations whose futures have become ready at the right time.
+This example begins to show the convenience of the futures programming model, which allows the programmer to neatly encapsulate complex asynchronous operations. `slow()` might involve a complex asynchronous operation requiring multiple steps, but its user can use it just as easily as a simple `sleep()`, and Seastar's engine takes care of running the continuations whose futures have become ready at the right time.
 
 ## Ready futures
 A future value might already be ready when `then()` is called to chain a continuation to it. This important case is optimized, and *usually* the continuation is run immediately instead of being registered to run later in the next iteration of the event loop.
 
-This optimization is done *usually*, though sometimes it is avoided: The implementation of `then()` holds a counter of such immediate continuations, and after many continuations have been run immediately without returning to the event loop (currently the limit is 256), the next continuation is deferred to the event loop in any case. This is important because in some cases (such as future loops, discussed later) we could find that each ready continuation spawns a new one, and without this limit we can starve the event loop. It important not to starve the event loop, as this would starve continuations of futures that weren't ready but have since become ready, and also starve the important **polling** done by the event loop (e.g., checking whether there is new activity on the network card).
+This optimization is done *usually*, though sometimes it is avoided: The implementation of `then()` holds a counter of such immediate continuations, and after many continuations have been run immediately without returning to the event loop (currently the limit is 256), the next continuation is deferred to the event loop in any case. This is important because in some cases (such as future loops, discussed later) we could find that each ready continuation spawns a new one, and without this limit we can starve the event loop. It is important not to starve the event loop, as this would starve continuations of futures that weren't ready but have since become ready, and also starve the important **polling** done by the event loop (e.g., checking whether there is new activity on the network card).
 
 `make_ready_future<>` can be used to return a future which is already ready. The following example is identical to the previous one, except the promise function `fast()` returns a future which is already ready, and not one which will be ready in a second as in the previous example. The nice thing is that the consumer of the future does not care, and uses the future in the same way in both cases.
 
@@ -356,6 +326,138 @@ seastar::future<> f() {
     return fast().then([] (int val) {
         std::cout << "Got " << val << "\n";
     });
+}
+```
+
+# Coroutines
+
+Note: coroutines require C++20 and a supporting compiler. Clang 10 and above is known to work.
+
+The simplest way to write efficient asynchronous code with Seastar is to use coroutines. Coroutines don't share most of the pitfalls of traditional continuations (below), and so are the preferred way to write new code.
+
+A coroutine is a function that returns a `seastar::future<T>` and uses the `co_await` or `co_return` keywords. Coroutines are invisible to their callers and callees; they integrate with traditional Seastar code in either role. If you are not familiar with C++ coroutines, you may want to consult [A more general introduction to C++ coroutines](https://medium.com/pranayaggarwal25/coroutines-in-cpp-15afdf88e17e); this section focuses on how coroutines integrate with Seastar.
+
+Here's an example of a simple Seastar coroutine:
+
+```cpp
+#include <seastar/core/coroutine.hh>
+
+seastar::future<int> read();
+seastar::future<> write(int n);
+
+seastar::future<int> slow_fetch_and_increment() {
+    auto n = co_await read();     // #1
+    co_await seastar::sleep(1s);  // #2
+    auto new_n = n + 1;           // #3
+    co_await write(new_n);        // #4
+    co_return n;                  // #5
+}
+```
+
+In #1, we call the `read()` function, which returns a future. The `co_await` keyword instructs Seastar to inspect the returned future. If the future is ready, then the value (an `int`) is extracted from the future and assigned to `n`. If the future is not ready, the coroutine arranges for itself to be called when the future becomes ready, and control is returned to Seastar. Once the future becomes ready, the coroutine is awakened and the value is extracted from the future and assigned to `n`.
+
+In #2, we call `seastar::sleep()` and wait for the returned future to become ready, which it will in a second. This demonstrates that `n` is preserved across `co_await` calls, and the author of the coroutine need not arrange for storage for coroutine local variables.
+
+Line #3 demonstrates the addition operation, with which the reader is assumed to be familiar.
+
+In #4, we call a function that returns a `seastar::future<>`. In this case, the future carries no value, and so no value is extracted and assigned.
+
+Line #5 demonstrates returning a value. The integer value is used to satisfy the `future<int>` that our caller got when calling the coroutine.
+
+## Exceptions in coroutines
+
+Coroutines automatically translate exceptions to futures and back.
+
+Calling `co_await foo()`, when `foo()` returns an exceptional future, will throw the exception carried by the future.
+
+Similarly throwing within a coroutine will cause the coroutine to return an exceptional future.
+
+Example:
+
+```cpp
+#include <seastar/core/coroutine.hh>
+
+seastar::future<> function_returning_an_exceptional_future();
+
+seastar::future<> exception_handling() {
+    try {
+        co_await function_returning_an_exceptional_future();
+    } catch (...) {
+        // exception will be handled here
+    }
+    throw 3; // will be captured by coroutine and returned as
+             // an exceptional future
+}
+```
+
+In certain cases, exceptions can also be propagated directly, without throwing or rethrowing them. It can be achieved by returning a `coroutine::exception` wrapper, but it unfortunately only works for coroutines which return `future<T>`, not `future<>`, due to the limitations in compilers. In particular, the example above won't compile if the return type is changed to `future<>`.
+
+Example:
+
+```cpp
+seastar::future<int> exception_propagating() {
+    std::exception_ptr eptr;
+    try {
+        co_await function_returning_an_exceptional_future();
+    } catch (...) {
+        eptr = std::current_exception();
+    }
+    if (eptr) {
+        co_return seastar::coroutine::exception(eptr); // Saved exception pointer can be propagated without rethrowing
+    }
+    co_return seastar::coroutine::make_exception(3); // Custom exceptions can be propagated without throwing
+}
+```
+
+## Concurrency in coroutines
+
+The `co_await` operator allows for simple sequential execution. Multiple coroutines can execute in parallel, but each coroutine has only one outstanding computation at a time.
+
+The `seastar::coroutine::all` class template allows a coroutine to fork into several concurrently executing sub-coroutines (or Seastar fibers, see below) and join again when they complete. Consider this example:
+
+
+```cpp
+#include <seastar/core/coroutines.hh>
+#include <seastar/coroutine/all.hh>
+
+seastar::future<int> read(int key);
+
+seastar::future<int> parallel_sum(int key1, int key2) {
+    int [a, b] = co_await seastar::coroutine::all(
+        [&] {
+            return read(key1);
+        },
+        [&] {
+            return read(key2);
+        }
+    );
+    co_return a + b;
+}
+```
+
+Here, two read() calls are launched concurrently. The coroutine is paused until both reads complete, and the values returned are assigned to `a` and `b`. If `read(key)` is an operation that involves I/O, then the concurrent execution will complete sooner than if we `co_await`ed each call separately, since I/O can be overlapped.
+
+
+Note that `all` waits for all of its sub-computations, even if some throw an exception. If an exception is thrown, it is propagated to the calling coroutine.
+
+## Breaking up long running computations
+
+Seastar is generally used for I/O, and coroutines usually launch I/O operations and consume their results, with little computation in between. But occasionally a long running computation is needed, and this risks preventing the reactor from performing I/O and scheduling other tasks.
+
+A coroutine will automatically yield in a `co_await` expression; but in a computation we do not `co_await` anything. We can use the `seastar::coroutine::maybe_yield` class in such cases:
+
+```cpp
+#include <seastar/coroutine/maybe_yield>
+
+seastar::future<int> long_loop(int n) {
+    float acc = 0;
+    for (int i = 0; i < n; ++i) {
+        acc += std::sin(float(i));
+        // Give the Seastar reactor opportunity to perform I/O or schedule
+        // other tasks.
+        co_await seastar::coroutine::maybe_yield();
+    }
+    co_return acc;
 }
 ```
 
@@ -398,7 +500,7 @@ this would have meant that the continuation would contain the address of `i`, no
 
 An exception to the capture-by-reference-is-usually-a-mistake rule is the `do_with()` idiom, which we will introduce later. This idiom ensures that an object lives throughout the life of the continuation, and makes capture-by-reference possible, and very convenient.
 
-Using capture-by-*move* in continuations is also very useful in Seastar applications. By **moving** an object into a continuation, we transfer ownership of this object to the continuation, and make it easy for the object to be automatically deleted when the continuation ends. For example, consider a traditional function taking a std::unique_ptr<T>.
+Using capture-by-*move* in continuations is also very useful in Seastar applications. By **moving** an object into a continuation, we transfer ownership of this object to the continuation, and make it easy for the object to be automatically deleted when the continuation ends. For example, consider a traditional function taking a `std::unique_ptr<T>`.
 ```cpp
 int do_something(std::unique_ptr<T> obj) {
      // do some computation based on the contents of obj, let's say the result is 17
@@ -444,7 +546,7 @@ Consequently, avoid the programming pattern below:
 
 In the example above, `[obj = std::move(obj)]` might be evaluated before `do_something(obj)` is called, potentially leading to use-after-move of `obj`.
 
-To guarantee the desired evaluation order, the expression above may be broken into separate statments as follows:
+To guarantee the desired evaluation order, the expression above may be broken into separate statements as follows:
 ```cpp
     auto fut = do_something(obj);
     return fut.then([obj = std::move(obj)] () mutable {
@@ -622,7 +724,7 @@ seastar::future<> slow_op(std::unique_ptr<T> p) {
 
 ## Keeping ownership at the caller
 
-The technique we described above - giving the continuation ownership of the object it needs to work on - is powerful and safe. But often it becomes hard and verbose to use. When an asynchronous operation involves not just one continuation but a chain of continations that each needs to work on the same object, we need to pass the ownership of the object between each successive continuation, which can become inconvenient. It is especially inconvenient when we need to pass the same object into two seperate asynchronous functions (or continuations) - after we move the object into one, the object needs to be returned so it can be moved again into the second. E.g.,
+The technique we described above - giving the continuation ownership of the object it needs to work on - is powerful and safe. But often it becomes hard and verbose to use. When an asynchronous operation involves not just one continuation but a chain of continuations that each needs to work on the same object, we need to pass the ownership of the object between each successive continuation, which can become inconvenient. It is especially inconvenient when we need to pass the same object into two separate asynchronous functions (or continuations) - after we move the object into one, the object needs to be returned so it can be moved again into the second. E.g.,
 ```cpp
 seastar::future<> slow_op(T o) {
     return seastar::sleep(10ms).then([o = std::move(o)] {
@@ -630,7 +732,7 @@ seastar::future<> slow_op(T o) {
         ...
         // return o so the next continuation can use it!
         return std::move(o);
-    }).then([](T o)) {
+    }).then([](T o) {
         // second continuation, doing something with o
         ...
     });
@@ -711,7 +813,7 @@ seastar::future<> f() {
     }
 }
 ```
-Here, although `obj` was correctly passed to the lambda by reference, we later acidentally passed `slow_op()` a copy of it (because here `slow_op` takes the object by value, not by reference), and this copy will be destroyed as soon as `slow_op` returns, not waiting until the returned future resolves.
+Here, although `obj` was correctly passed to the lambda by reference, we later accidentally passed `slow_op()` a copy of it (because here `slow_op` takes the object by value, not by reference), and this copy will be destroyed as soon as `slow_op` returns, not waiting until the returned future resolves.
 
 When using `do_with`, always remember it requires adhering to the convention described above: The asynchronous function which we call inside `do_with` must not use the objects held by `do_with` *after* the returned future is resolved. It is a serious use-after-free bug for an asynchronous function to return a future which resolves while still having background operations using the `do_with()`ed objects.
 
@@ -719,40 +821,29 @@ In general, it is rarely a good idea for an asynchronous function to resolve whi
 
 
 ## Sharing ownership (reference counting)
-In the beginning of this chapter, we already noted that capturing a copy of an object into a continuation is the simplest way to ensure that the object is alive when the continuation runs and destoryed afterwards. However, complex objects are often expensive (in time and memory) to copy. Some objects cannot be copied at all, or are read-write and the continuation should modify the original object, not a new copy. The solution to all these issues are **reference counted**, a.k.a. **shared** objects:
+In the beginning of this chapter, we already noted that capturing a copy of an object into a continuation is the simplest way to ensure that the object is alive when the continuation runs and destroyed afterwards. However, complex objects are often expensive (in time and memory) to copy. Some objects cannot be copied at all, or are read-write and the continuation should modify the original object, not a new copy. The solution to all these issues are **reference counted**, a.k.a. **shared** objects:
 
 A simple example of a reference-counted object in Seastar is a `seastar::file`, an object holding an open file object (we will introduce `seastar::file` in a later section). A `file` object can be copied, but copying does not involve copying the file descriptor (let alone the file). Instead, both copies point to the same open file, and a reference count is increased by 1. When a file object is destroyed, the file's reference count is decreased by one, and only when the reference count reaches 0 the underlying file is actually closed.
 
-The fact that `file` objects can be copied very quickly and all copies actually point to the same file, make it very convinient to pass them to asynchronous code; For example,
+The fact that `file` objects can be copied very quickly and all copies actually point to the same file, make it very convenient to pass them to asynchronous code; For example,
 
 ```cpp
 seastar::future<uint64_t> slow_size(file f) {
     return seastar::sleep(10ms).then([f] {
         return f.size();
-    }); 
-    // NOTE: something is wrong here! This will be explained below!
+    });
 }
 ```
 
 Note how calling `slow_size` is as simple as calling `slow_size(f)`, passing a copy of `f`, without  needing to do anything special to ensure that `f` is only destroyed when no longer needed. That simply happens naturally when nothing refers to `f` any more.
 
-However, there is one complication. The above example is actually wrong, as the comment at the end of the function suggested. The problem is that the `f.size()` call started an asynchronous operation on `f` (the file's size may be stored on disk, so not immediately available) and yet at this point nothing is holding a copy of `f`... The method call does not increment the reference count of the object even if it an asynchronous method. (Perhaps this something we should rethink?)
-
-So we need to ensure that something does hold on to another copy of `f` until the asynchronous method call completes. This is how we typically do it:
-```cpp
-seastar::future<uint64_t> slow_size(file f) {
-    return seastar::sleep(10ms).then([f] {
-        return f.size().finally([f] {});
-    });
-}
-```
-What we see here is that `f` is copied not only to the continuation which runs `f.size()`, but also into a continuation (a `finally`) which will run after it. So as long as `f.size()` does not complete, that second continuation holds `f` alive. Note how the second continuation seems to have no code (just a {}).  But the important thing is that the compiler automatically adds to it code to destroy its copy of `f` (and potentially the entire file if this reference count went down to 0).
+You may wonder why `return f.size()` in the above example is safe:  Doesn't it start an asynchronous operation on `f` (the file's size may be stored on disk, so not immediately available), and `f` may be  immediately destroyed when we return and nothing keeps holding a copy of `f`? If `f` is really the last reference, that is indeed a bug, but there is another one: the file is never closed. The assumption that makes the code valid is that there is another reference to `f` that will be used to close it. The close member function holds on to the reference count of that object, so it continues to live even if nothing else keeps holding on to it. Since all futures produced by a file object complete before it is closed, all that is needed for correctness is to remember to always close files.
 
 The reference counting has a run-time cost, but it is usually very small; It is important to remember that Seastar objects are always used by a single CPU only, so the reference-count increment and decrement operations are not the slow atomic operations often used for reference counting, but just regular CPU-local integer operations. Moreover, judicious use of `std::move()` and the compiler's optimizer can reduce the number of unnecessary back-and-forth increment and decrement of the reference count.
 
 C++11 offers a standard way of creating reference-counted shared objects - using the template `std::shared_ptr<T>`. A `shared_ptr` can be used to wrap any type into a reference-counted shared object like `seastar::file` above.  However, the standard `std::shared_ptr` was designed with multi-threaded applications in mind so it uses slow atomic increment/decrement operations for the reference count which we already noted is unnecessary in Seastar. For this reason Seastar offers its own single-threaded implementation of this template, `seastar::shared_ptr<T>`. It is similar to `std::shared_ptr<T>` except no atomic operations are used.
 
-Additionally, Seastar also provides an even lower overhead variant of `shared_ptr`: `seastar::lw_shared_ptr<T>`. The full-featured `shared_ptr` is complicated by the need to support polymorphic types correctly (a shared object created of one class, and accessed through a pointer to a base class). It makes `shared_ptr` need to add two words to the shared object, and two words to each `shared_ptr` copy. The simplified `lw_shared_ptr` - which does **not** support polymorphic types - adds just one word in the object (the reference count) and each copy is just one word - just like copying a regular pointer. For this reason, the light-weight `seastar::lw_shared_ptr<T>` should be preferered when possible (`T` is not a polymorphic type), otherwise `seastar::shared_ptr<T>`. The slower `std::shared_ptr<T>` should never be used in sharded Seastar applications.
+Additionally, Seastar also provides an even lower overhead variant of `shared_ptr`: `seastar::lw_shared_ptr<T>`. The full-featured `shared_ptr` is complicated by the need to support polymorphic types correctly (a shared object created of one class, and accessed through a pointer to a base class). It makes `shared_ptr` need to add two words to the shared object, and two words to each `shared_ptr` copy. The simplified `lw_shared_ptr` - which does **not** support polymorphic types - adds just one word in the object (the reference count) and each copy is just one word - just like copying a regular pointer. For this reason, the light-weight `seastar::lw_shared_ptr<T>` should be preferred when possible (`T` is not a polymorphic type), otherwise `seastar::shared_ptr<T>`. The slower `std::shared_ptr<T>` should never be used in sharded Seastar applications.
 
 ## Saving objects on the stack
 Wouldn't it be convenient if we could save objects on a stack just like we normally do in synchronous code? I.e., something like:
@@ -776,8 +867,9 @@ We present `seastar::thread`, `seastar::async()` and `seastar::future::get()` in
 # Advanced futures
 ## Futures and interruption
 TODO: A future, e.g., sleep(10s) cannot be interrupted. So if we need to, the promise needs to have a mechanism to interrupt it. Mention pipe's close feature, semaphore stop feature, etc.
+
 ## Futures are single use
-TODO: Talk about if we have a future<int> variable, as soon as we get() or then() it, it becomes invalid - we need to store the value somewhere else. Think if there's an alternative we can suggest
+TODO: Talk about if we have a `future<int>` variable, as soon as we `get()` or `then()` it, it becomes invalid - we need to store the value somewhere else. Think if there's an alternative we can suggest
 
 # Fibers
 Seastar continuations are normally short, but often chained to one another, so that one continuation does a bit of work and then schedules another continuation for later. Such chains can be long, and often even involve loopings - see the following section, "Loops". We call such chains "fibers" of execution.
@@ -788,6 +880,7 @@ TODO: Mention fiber-related sections like loops, semaphores, gates, pipes, etc.
 
 # Loops
 A majority of time-consuming computations involve using loops. Seastar provides several primitives for expressing them in a way that composes nicely with the future/promise model. A very important aspect of Seastar loop primitives is that each iteration is followed by a preemption point, thus allowing other tasks to run inbetween iterations.
+
 ## repeat
 A loop created with `repeat` executes its body until it receives a `stop_iteration` object, which informs if the iteration should continue (`stop_iteration::no`) or stop (`stop_iteration::yes`). Next iteration will be launched only after the first one has finished. The loop body passed to `repeat` is expected to have a `future<stop_iteration>` return type.
 ```cpp
@@ -799,7 +892,7 @@ seastar::future<> push_until_100(seastar::lw_shared_ptr<std::vector<int>> queue,
             return make_ready_future<stop_iteration>(stop_iteration::yes);
         }
         return recompute_number(element).then([queue] (int new_element) {
-            queue->push_back(element);
+            queue->push_back(new_element);
             return stop_iteration::no;
         });
     });
@@ -849,11 +942,11 @@ seastar::future<> do_for_all(std::vector<int> numbers) {
         });
     });
 }
-
 ```
 
 ## parallel_for_each
 Parallel for each is a high concurrency variant of `do_for_each`. When using `parallel_for_each`, all iterations are queued simultaneously - which means that there's no guarantee in which order they finish their operations.
+
 ```cpp
 seastar::future<> flush_all_files(seastar::lw_shared_ptr<std::vector<seastar::file>> files) {
     return seastar::parallel_for_each(files, [] (seastar::file f) {
@@ -863,11 +956,31 @@ seastar::future<> flush_all_files(seastar::lw_shared_ptr<std::vector<seastar::fi
 }
 ```
 `parallel_for_each` is a powerful tool, as it allows spawning many tasks in parallel. It can be a great performance gain, but there are also caveats. First of all, too high concurrency may be troublesome - the details can be found in chapter **Limiting parallelism of loops**.
+
+To restrict the concurrency of `parallel_for_each` by an integer number, use `max_concurrent_for_each` that is described below.
+More details about dealing with parallelism can be found in chapter **Limiting parallelism of loops**.
+
 Secondly, take note that the order in which iterations will be executed within a `parallel_for_each` loop is arbitrary - if a strict ordering is needed, consider using `do_for_each` instead.
 
 TODO: map_reduce, as a shortcut (?) for parallel_for_each which needs to produce some results (e.g., logical_or of boolean results), so we don't need to create a lw_shared_ptr explicitly (or do_with).
 
 TODO: See seastar commit "input_stream: Fix possible infinite recursion in consume()" for an example on why recursion is a possible, but bad, replacement for repeat(). See also my comment on https://groups.google.com/d/msg/seastar-dev/CUkLVBwva3Y/3DKGw-9aAQAJ on why Seastar's iteration primitives should be used over tail call optimization.
+
+## max_concurrent_for_each
+Max concurrent for each is a variant of `parallel_for_each` with restricted parallelism.
+It accepts an additional parameter - `max_concurrent` - with which, up to `max_concurrent` iterations are queued simultaneously, with no guarantee in which order they finish their operations.
+
+```cpp
+seastar::future<> flush_all_files(seastar::lw_shared_ptr<std::vector<seastar::file>> files, size_t max_concurrent) {
+    return seastar::max_concurrent_for_each(files, max_concurrent, [] (seastar::file f) {
+        return f.flush();
+    });
+}
+```
+
+Determining the maximum concurrency limit is out of the scope of this document.
+It should typically be derived from the actual capabilities of the system the software is running on, like the number of parallel execution units or I/O channels, so to optimize utilization of resources without overwhelming the system.
+
 # when_all: Waiting for multiple futures
 Above we've seen `parallel_for_each()`, which starts a number of asynchronous operations, and then waits for all to complete. Seastar has another idiom, `when_all()`, for waiting for several already-existing futures to complete.
 
@@ -1011,7 +1124,7 @@ seastar::future<> g() {
 
 But this version is **not** exception safe: Consider what happens if `slow()` throws an exception before returning a future (this is different from `slow()` returning an exceptional future - we discussed this difference in the section about exception handling). In this case, we decreased the counter, but the `finally()` will never be reached, and the counter will never be increased back. There is a way to fix this code, by replacing the call to `slow()` with `seastar::futurize_invoke(slow)`. But the point we're trying to make here is not how to fix buggy code, but rather that by using the separate `semaphore::wait()` and `semaphore::signal()` functions, you can very easily get things wrong.
 
-For exception safety, in C++ it is generally not recommended to have separate resource acquisition and release functions.  Instead, C++ offers safer mechanisms for acquiring a resource (in this case seamphore units) and later releasing it: lambda functions, and RAII ("resource acquisition is initialization"):
+For exception safety, in C++ it is generally not recommended to have separate resource acquisition and release functions.  Instead, C++ offers safer mechanisms for acquiring a resource (in this case semaphore units) and later releasing it: lambda functions, and RAII ("resource acquisition is initialization"):
 
 The lambda-based solution is a function ```seastar::with_semaphore()``` which is a shortcut for the code in the examples above:
 
@@ -1039,7 +1152,7 @@ seastar::future<> g() {
 
 Note the somewhat convoluted way that `get_units()` needs to be used: The continuations must be nested because we need the `units` object to be moved to the last continuation. If `slow()` returns a future (and does not throw immediately),  the `finally()` continuation captures the `units` object until everything is done, but does not run any code.
 
-Seastars programmers should generally avoid using the the `seamphore::wait()` and `semaphore::signal()` functions directly, and always prefer either `with_semaphore()` (when applicable) or `get_units()`.
+Seastars programmers should generally avoid using the the `semaphore::wait()` and `semaphore::signal()` functions directly, and always prefer either `with_semaphore()` (when applicable) or `get_units()`.
 
 
 ## Limiting resource use
@@ -1107,6 +1220,7 @@ seastar::future<> f() {
 ```
 
 Note how this code differs from the code we saw above for limiting the number of parallel invocations of a function `g()`:
+
 1. Here we cannot use a single `thread_local` semaphore. Each call to `f()` has its loop with parallelism of 100, so needs its own semaphore "`limit`", kept alive during the loop with `do_with()`.
 2. Here we do not wait for `slow()` to complete before continuing the loop, i.e., we do not `return` the future chain starting at `futurize_invoke(slow)`. The loop continues to the next iteration when a semaphore unit becomes available, while (in our example) 99 other operations might be ongoing in the background and we do not wait for them.
 
@@ -1273,6 +1387,7 @@ Now, just one second after gate is closed (after the "starting 5" message is pri
 # Introducing shared-nothing programming
 
 TODO: Explain in more detail Seastar's shared-nothing approach where the entire memory is divided up-front to cores, malloc/free and pointers only work on one core.
+
 TODO: Introduce our shared_ptr (and lw_shared_ptr) and sstring and say the standard ones use locked instructions which are unnecessary when we assume these objects (like all others) are for a single thread. Our futures and continuations do the same.
 
 
@@ -1308,25 +1423,26 @@ We begin with a simple example of a TCP network server written in Seastar. This 
 #include <seastar/core/seastar.hh>
 #include <seastar/core/reactor.hh>
 #include <seastar/core/future-util.hh>
-#include <iostream>
+#include <seastar/net/api.hh>
 
 seastar::future<> service_loop() {
     return seastar::do_with(seastar::listen(seastar::make_ipv4_address({1234})),
             [] (auto& listener) {
         return seastar::keep_doing([&listener] () {
             return listener.accept().then(
-                [] (seastar::connected_socket s, seastar::socket_address a) {
-                    std::cout << "Accepted connection from " << a << "\n";
-                });
+                [] (seastar::accept_result res) {
+                    std::cout << "Accepted connection from " << res.remote_address << "\n";
+            });
         });
     });
 }
 ```
 
 This code works as follows:
+
 1. The ```listen()``` call creates a ```server_socket``` object, ```listener```, which listens on TCP port 1234 (on any network interface).
 2. We use ```do_with()``` to ensure that the listener socket lives throughout the loop.
-3. To handle one connection, we call ```listener```'s  ```accept()``` method. This method returns a ```future<connected_socket, socket_address>```, i.e., is eventually resolved with an incoming TCP connection from a client (```connected_socket```) and the client's IP address and port (```socket_address```).
+3. To handle one connection, we call ```listener```'s  ```accept()``` method. This method returns a ```future<accept_result>```, i.e., is eventually resolved with an incoming TCP connection from a client (```accept_result.connection```) and the client's IP address and port (```accept_result.remote_address```).
 4. To repeatedly accept new connections, we use the ```keep_doing()``` loop idiom. ```keep_doing()``` runs its lambda parameter over and over, starting the next iteration as soon as the future returned by the previous iteration completes. The iterations only stop if an exception is encountered. The future returned by ```keep_doing()``` itself completes only when the iteration stops (i.e., only on exception).
 
 Output from this server looks like the following example:
@@ -1361,7 +1477,7 @@ Let's advance our example server by outputting some canned response to each conn
 #include <seastar/core/seastar.hh>
 #include <seastar/core/reactor.hh>
 #include <seastar/core/future-util.hh>
-#include <iostream>
+#include <seastar/net/api.hh>
 
 const char* canned_response = "Seastar is the future!\n";
 
@@ -1372,15 +1488,16 @@ seastar::future<> service_loop() {
             [] (auto& listener) {
         return seastar::keep_doing([&listener] () {
             return listener.accept().then(
-                [] (seastar::connected_socket s, seastar::socket_address a) {
-                    auto out = s.output();
-                    return seastar::do_with(std::move(s), std::move(out),
+                    [] (seastar::accept_result res) {
+                auto s = std::move(res.connection);
+                auto out = s.output();
+                return seastar::do_with(std::move(s), std::move(out),
                         [] (auto& s, auto& out) {
-                            return out.write(canned_response).then([&out] {
-                                return out.close();
-			    });
-		    });
-	        });
+                    return out.write(canned_response).then([&out] {
+                        return out.close();
+                    });
+                });
+            });
         });
     });
 }
@@ -1409,49 +1526,52 @@ Let's look at a simple example server involving both reads an writes. This is a 
 #include <seastar/core/seastar.hh>
 #include <seastar/core/reactor.hh>
 #include <seastar/core/future-util.hh>
+#include <seastar/net/api.hh>
 
 seastar::future<> handle_connection(seastar::connected_socket s,
                                     seastar::socket_address a) {
     auto out = s.output();
     auto in = s.input();
     return do_with(std::move(s), std::move(out), std::move(in),
-        [] (auto& s, auto& out, auto& in) {
-            return seastar::repeat([&out, &in] {
-                return in.read().then([&out] (auto buf) {
-                    if (buf) {
-                        return out.write(std::move(buf)).then([&out] {
-                            return out.flush();
-                        }).then([] {
-                            return seastar::stop_iteration::no;
-                        });
-                    } else {
-                        return seastar::make_ready_future<seastar::stop_iteration>(
+            [] (auto& s, auto& out, auto& in) {
+        return seastar::repeat([&out, &in] {
+            return in.read().then([&out] (auto buf) {
+                if (buf) {
+                    return out.write(std::move(buf)).then([&out] {
+                        return out.flush();
+                    }).then([] {
+                        return seastar::stop_iteration::no;
+                    });
+                } else {
+                    return seastar::make_ready_future<seastar::stop_iteration>(
                             seastar::stop_iteration::yes);
-                    }
-                });
-            }).then([&out] {
-                return out.close();
+                }
             });
+        }).then([&out] {
+            return out.close();
         });
+    });
 }
 
-seastar::future<> service_loop() {
+seastar::future<> service_loop_3() {
     seastar::listen_options lo;
     lo.reuse_address = true;
     return seastar::do_with(seastar::listen(seastar::make_ipv4_address({1234}), lo),
             [] (auto& listener) {
         return seastar::keep_doing([&listener] () {
             return listener.accept().then(
-                [] (seastar::connected_socket s, seastar::socket_address a) {
-                    // Note we ignore, not return, the future returned by
-                    // handle_connection(), so we do not wait for one
-                    // connection to be handled before accepting the next one.
-                    handle_connection(std::move(s), std::move(a));
+                    [] (seastar::accept_result res) {
+                // Note we ignore, not return, the future returned by
+                // handle_connection(), so we do not wait for one
+                // connection to be handled before accepting the next one.
+                (void)handle_connection(std::move(res.connection), std::move(res.remote_address)).handle_exception(
+                        [] (std::exception_ptr ep) {
+                    fmt::print(stderr, "Could not handle connection: {}\n", ep);
                 });
+            });
         });
     });
 }
-
 ```
 
 The main function ```service_loop()``` loops accepting new connections, and for each connection calls ```handle_connection()``` to handle this connection. Our ```handle_connection()``` returns a future saying when handling this connection completed, but importantly, we do ***not*** wait for this future: Remember that ```keep_doing``` will only start the next iteration when the future returned by the previous iteration is resolved. Because we want to allow parallel ongoing connections, we don't want the next ```accept()``` to wait until the previously accepted connection was closed. So we call ```handle_connection()``` to start the handling of the connection, but return nothing from the continuation, which resolves that future immediately, so ```keep_doing``` will continue to the next ```accept()```.
@@ -1544,6 +1664,7 @@ All Seastar applications accept a standard set of command-line arguments, such a
 TODO: list and explain more of these options.
 
 Every Seastar application also accepts the `-h` (or `--help`) option, which lists and explains all the available options --- the standard Seastar ones, and the user-defined ones as explained below.
+
 ## User-defined command-line options
 Seastar parses the command line options (`argv[]`) when it is passed to `app_template::run()`, looking for its own standard options. Therefore, it is not recommended that the application tries to parse `argv[]` on its own because the application might not understand some of the standard Seastar options and not be able to correctly skip them.
 
@@ -1580,7 +1701,7 @@ int main(int argc, char** argv) {
 }
 ```
 
-In this example, we add via `add_options()` two application-specific options: `--flag` is an optional parameter which doesn't take any additional agruments, and `--size` (or `-s`) takes an integer value, which defaults (if this option is missing) to 100. Additionally, we ask via `add_positional_options()` that an unlimited number of arguments that do not begin with a "`-`" --- the so-called _positional_ arguments --- be collected to a vector of strings under the "filename" option. Some example outputs from this program:
+In this example, we add via `add_options()` two application-specific options: `--flag` is an optional parameter which doesn't take any additional arguments, and `--size` (or `-s`) takes an integer value, which defaults (if this option is missing) to 100. Additionally, we ask via `add_positional_options()` that an unlimited number of arguments that do not begin with a "`-`" --- the so-called _positional_ arguments --- be collected to a vector of strings under the "filename" option. Some example outputs from this program:
 
 ```
 $ ./a.out
@@ -1794,8 +1915,11 @@ In the current implementation, both `make_exception_future_with_backtrace` and `
 
 
 ## Debugging with gdb
+
+```
 handle SIGUSR1 pass noprint
 handle SIGALRM pass noprint
+```
 
 # Promise objects
 
@@ -1818,7 +1942,7 @@ Seastar requires that applications be sharded, i.e., that code running on differ
 
 To achieve this per-thread allocation, Seastar redefines the C library functions `malloc()`, `free()`, and their numerous relatives --- `calloc()`, `realloc()`, `posix_memalign()`, `memalign()`, `malloc_usable_size()`, and `malloc_trim()`. It also redefines the C++ memory allocation functions, `operator new`, `operator delete`,  and all their variants (including array versions, the C++14 delete taking a size, and the C++17 variants taking required alignment).
 
-It is important to remember that Seastar's different threads *can* see memory allocated by other threads, but they are nontheless strongly discouraged from actually doing this. Sharing data objects between threads on modern multi-core machines results in stiff performance penalties from locks, memory barriers, and cache-line bouncing. Rather, Seastar encourages applications to avoid sharing objects between threads when possible (by *sharding* --- each thread owns a subset of the objects), and when threads do need to interact they do so with explicit message passing, with `submit_to()`, as we shall see later.
+It is important to remember that Seastar's different threads *can* see memory allocated by other threads, but they are nonetheless strongly discouraged from actually doing this. Sharing data objects between threads on modern multi-core machines results in stiff performance penalties from locks, memory barriers, and cache-line bouncing. Rather, Seastar encourages applications to avoid sharing objects between threads when possible (by *sharding* --- each thread owns a subset of the objects), and when threads do need to interact they do so with explicit message passing, with `submit_to()`, as we shall see later.
 
 ## Foreign pointers
 An object allocated on one thread will be owned by this thread, and eventually should be freed by the same thread. Freeing memory on the *wrong* thread is strongly discouraged, but is currently supported (albeit slowly) to support library code beyond Seastar's control. For example, `std::exception_ptr` allocates memory; So if we invoke an asynchronous operation on a remote thread and this operation returns an exception, when we free the returned `std::exception_ptr` this will happen on the "wrong" core. So Seastar allows it, but inefficiently.
@@ -1838,6 +1962,7 @@ So `seastar::foreign_ptr<>` not only has functional benefits (namely, to run the
 Above, we discussed the case of transferring ownership of an object to a another shard, via `seastar::foreign_ptr<std::unique_ptr<T>>`. However, sometimes the sender does not want to relinquish ownership of the object. Sometimes, it wants the remote thread to operate on its object and return with the object intact. Sometimes, it wants to send the same object to multiple shards. In such cases, `seastar::foreign_ptr<seastar::lw_shared_ptr<T>> is useful. The user needs to watch out, of course, not to operate on the same object from multiple threads concurrently. If this cannot be ensured by program logic alone, some methods of serialization must be used - such as running the operations on the home shard with `submit_to()` as described above.
 
 Normally, a `seastar::foreign_ptr` cannot not be copied - only moved. However, when it holds a smart pointer that can be copied (namely, a `shared_ptr`), one may want to make an additional copy of that pointer and create a second `foreign_ptr`. Doing this is inefficient and asynchronous (it requires communicating with the original owner of the object to create the copies), so a method `future<foreign_ptr> copy()` needs to be explicitly used instead of the normal copy constructor.
+
 # Seastar::thread
 Seastar's programming model, using futures and continuations, is very powerful and efficient.  However, as we've already seen in examples above, it is also relatively verbose: Every time that we need to wait before proceeding with a computation, we need to write another continuation. We also need to worry about passing the data between the different continuations (using techniques like those described in the [Lifetime management] section). Simple flow-control constructs such as loops also become more involved using continuations. For example, consider this simple classical synchronous code:
 ```cpp
@@ -1858,7 +1983,7 @@ In Seastar, using futures and continuations, we need to write something like thi
     });
 ```
 
-But Seastar also allows, via `seastar::thread`, to write code which looks more like synchronous code. A `seastar::thread` provides an execution environment where blocking is tolerated; You can issue an asyncrhonous function, and wait for it in the same function, rather then establishing a callback to be called with `future<>::then()`:
+But Seastar also allows, via `seastar::thread`, to write code which looks more like synchronous code. A `seastar::thread` provides an execution environment where blocking is tolerated; You can issue an asynchronous function, and wait for it in the same function, rather then establishing a callback to be called with `future<>::then()`:
 
 ```cpp
     seastar::thread th([] {
@@ -1873,7 +1998,7 @@ A `seastar::thread` is **not** a separate operating system thread. It still uses
 
 The `seastar::thread` allocates a 128KB stack, and runs the given function until the it *blocks* on the call to a future's `get()` method. Outside a `seastar::thread` context, `get()` may only be called on a future which is already available. But inside a thread, calling `get()` on a future which is not yet available stops running the thread function, and schedules a continuation for this future, which continues to run the thread's function (on the same saved stack) when the future becomes available.
 
-Just like normal Seastar continuations, `seastar::thread`s always run on the same core they were launched on. They are also cooperative: they are never preempted except when `seastar::future::get()` blocks or on explict calls to `seastar::thread::yield()`.
+Just like normal Seastar continuations, `seastar::thread`s always run on the same core they were launched on. They are also cooperative: they are never preempted except when `seastar::future::get()` blocks or on explicit calls to `seastar::thread::yield()`.
 
 It is worth reiterating that a `seastar::thread` is not a POSIX thread, and it can only block on Seastar futures, not on blocking system calls. The above example used `seastar::sleep()`, not the `sleep()` system call. The `seastar::thread`'s function can throw and catch exceptions normally. Remember that `get()` will throw an exception if the future resolves with an exception.
 
@@ -1950,7 +2075,7 @@ But in the above example, what percentage of the CPU and disk throughput will th
 * The background operation may be a very "considerate" single fiber, i.e., run a very short continuation and then schedule the next continuation to run later. At each point the scheduler sees 100 request-handling continuations and just one of the background continuations ready to run. The background task gets around 1% of the CPU time, and users' requests are hardly delayed.
 * On the other hand, the background operation may spawn 1,000 fibers in parallel and have 1,000 ready-to-run continuations at each time. The background operation will get about 90% of the runtime, and the continuation handling a user's request may get stuck behind 1,000 of these background continuations, and experience huge latency.
 
-Complex Seastar applications often have different components which run in parallel and have different performance objectives. In the above example we saw two components - user requests and the background operation.  The first goal of the mechanisms we describe in this section is to _isolate_ the performance of each component from the others; In other words, the throughput and latency of one component should not depend on decisions that another component makes - e.g., how many continuations it runs in parallel. The second goal is to allow the application to _control_ this isolation, e.g., in the above example allow the application to explicitly control the amount of CPU the background operation recieves, so that it completes at a desired pace.
+Complex Seastar applications often have different components which run in parallel and have different performance objectives. In the above example we saw two components - user requests and the background operation.  The first goal of the mechanisms we describe in this section is to _isolate_ the performance of each component from the others; In other words, the throughput and latency of one component should not depend on decisions that another component makes - e.g., how many continuations it runs in parallel. The second goal is to allow the application to _control_ this isolation, e.g., in the above example allow the application to explicitly control the amount of CPU the background operation receives, so that it completes at a desired pace.
 
 In the above examples we used CPU time as the limited resource that the different components need to share effectively. As we show later, another important shared resource is disk I/O.
 
@@ -2050,11 +2175,15 @@ Counters: 2'273'783'385, 4'549'995'716
 ```
 ## Latency
 TODO: Task quota, preempt, loops with built-in preemption check, etc.
+
 ## Disk I/O scheduler
 TODO
+
 ## Network scheduler
 TODO: Say that not yet available. Give example of potential problem - e.g., sharing a slow WAN link.
+
 ## Controllers
 TODO: Talk about how to dynamically change the number of shares, and why.
+
 ## Multi-tenancy
 TODO

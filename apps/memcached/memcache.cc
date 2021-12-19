@@ -23,14 +23,13 @@
 #include <boost/intrusive/list.hpp>
 #include <boost/intrusive_ptr.hpp>
 #include <boost/lexical_cast.hpp>
-#include <boost/optional.hpp>
 #include <iostream>
 #include <iomanip>
 #include <sstream>
 #include <seastar/core/app-template.hh>
 #include <seastar/core/reactor.hh>
 #include <seastar/core/seastar.hh>
-#include <seastar/core/future-util.hh>
+#include <seastar/core/loop.hh>
 #include <seastar/core/timer-set.hh>
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/core/stream.hh>
@@ -68,7 +67,7 @@ static __thread slab_allocator<item>* slab;
 static thread_local std::unique_ptr<slab_allocator<item>> slab_holder;
 
 template<typename T>
-using optional = boost::optional<T>;
+using optional = std::optional<T>;
 
 using clock_type = lowres_clock;
 
@@ -185,19 +184,19 @@ public:
         return _version;
     }
 
-    const compat::string_view key() const {
-        return compat::string_view(_data, _key_size);
+    const std::string_view key() const {
+        return std::string_view(_data, _key_size);
     }
 
-    const compat::string_view ascii_prefix() const {
+    const std::string_view ascii_prefix() const {
         const char *p = _data + align_up(_key_size, field_alignment);
-        return compat::string_view(p, _ascii_prefix_size);
+        return std::string_view(p, _ascii_prefix_size);
     }
 
-    const compat::string_view value() const {
+    const std::string_view value() const {
         const char *p = _data + align_up(_key_size, field_alignment) +
             align_up(_ascii_prefix_size, field_alignment);
-        return compat::string_view(p, _value_size);
+        return std::string_view(p, _value_size);
     }
 
     size_t key_size() const {
@@ -1224,7 +1223,7 @@ class udp_server {
 public:
     static const size_t default_max_datagram_size = 1400;
 private:
-    compat::optional<future<>> _task;
+    std::optional<future<>> _task;
     sharded_cache& _cache;
     distributed<system_stats>& _system_stats;
     udp_channel _chan;
@@ -1251,12 +1250,18 @@ private:
         std::vector<packet> _out_bufs;
         ascii_protocol _proto;
 
+        static output_stream_options make_opts() noexcept {
+            output_stream_options opts;
+            opts.trim_to_size = true;
+            return opts;
+        }
+
         connection(ipv4_addr src, uint16_t request_id, input_stream<char>&& in, size_t out_size,
                 sharded_cache& c, distributed<system_stats>& system_stats)
             : _src(src)
             , _request_id(request_id)
             , _in(std::move(in))
-            , _out(output_stream<char>(data_sink(std::make_unique<vector_data_sink>(_out_bufs)), out_size, true))
+            , _out(output_stream<char>(data_sink(std::make_unique<vector_data_sink>(_out_bufs)), out_size, make_opts()))
             , _proto(c, system_stats)
         {}
 
@@ -1331,7 +1336,7 @@ public:
 
 class tcp_server {
 private:
-    compat::optional<future<>> _task;
+    std::optional<future<>> _task;
     lw_shared_ptr<seastar::server_socket> _listener;
     sharded_cache& _cache;
     distributed<system_stats>& _system_stats;

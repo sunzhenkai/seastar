@@ -21,6 +21,7 @@
 
 #pragma once
 
+#include <chrono>
 #include <typeindex>
 #include <seastar/core/sstring.hh>
 #include <seastar/core/function_traits.hh>
@@ -30,9 +31,15 @@
 
 namespace seastar {
 
-constexpr unsigned max_scheduling_groups() { return 16; }
+constexpr unsigned max_scheduling_groups() { return SEASTAR_SCHEDULING_GROUPS_COUNT; }
 
-template <typename... T>
+#if SEASTAR_API_LEVEL < 6
+#define SEASTAR_ELLIPSIS ...
+template <typename SEASTAR_ELLIPSIS T>
+#else
+#define SEASTAR_ELLIPSIS
+template <typename T = void>
+#endif
 class future;
 
 class reactor;
@@ -40,13 +47,18 @@ class reactor;
 class scheduling_group;
 class scheduling_group_key;
 
+using sched_clock = std::chrono::steady_clock;
+
 namespace internal {
 
 // Returns an index between 0 and max_scheduling_groups()
-unsigned scheduling_group_index(scheduling_group sg);
-scheduling_group scheduling_group_from_index(unsigned index);
+unsigned scheduling_group_index(scheduling_group sg) noexcept;
+scheduling_group scheduling_group_from_index(unsigned index) noexcept;
 
-unsigned long scheduling_group_key_id(scheduling_group_key);
+unsigned long scheduling_group_key_id(scheduling_group_key) noexcept;
+
+template<typename T>
+T* scheduling_group_get_specific_ptr(scheduling_group sg, scheduling_group_key key) noexcept;
 
 }
 
@@ -61,7 +73,7 @@ unsigned long scheduling_group_key_id(scheduling_group_key);
 /// \param shares number of shares of the CPU time allotted to the group;
 ///              Use numbers in the 1-1000 range (but can go above).
 /// \return a scheduling group that can be used on any shard
-future<scheduling_group> create_scheduling_group(sstring name, float shares);
+future<scheduling_group> create_scheduling_group(sstring name, float shares) noexcept;
 
 /// Destroys a scheduling group.
 ///
@@ -72,7 +84,7 @@ future<scheduling_group> create_scheduling_group(sstring name, float shares);
 ///
 /// \param sg The scheduling group to be destroyed
 /// \return a future that is ready when the scheduling group has been torn down
-future<> destroy_scheduling_group(scheduling_group sg);
+future<> destroy_scheduling_group(scheduling_group sg) noexcept;
 
 /// Rename scheduling group.
 ///
@@ -84,14 +96,14 @@ future<> destroy_scheduling_group(scheduling_group sg);
 /// \param sg The scheduling group to be renamed
 /// \param new_name The new name for the scheduling group.
 /// \return a future that is ready when the scheduling group has been renamed
-future<> rename_scheduling_group(scheduling_group sg, sstring new_name);
+future<> rename_scheduling_group(scheduling_group sg, sstring new_name) noexcept;
 
 
 /**
  * Represents a configuration for a specific scheduling group value,
  * it contains all that is needed to maintain a scheduling group specific
- * value when it needs to be created, due to, for example, a new \ref scheduling
- * group being created.
+ * value when it needs to be created, due to, for example, a new
+ * \ref scheduling_group being created.
  *
  * @note is is recomended to use @ref make_scheduling_group_key_config in order to
  * create and configure this syructure. The only reason that one might want to not use
@@ -141,27 +153,28 @@ struct scheduling_group_key_config {
 class scheduling_group_key {
 public:
     /// The only user allowed operation on a key is copying.
-    scheduling_group_key(const scheduling_group_key&) = default;
+    scheduling_group_key(const scheduling_group_key&) noexcept = default;
+    scheduling_group_key(scheduling_group_key&&) noexcept = default;
 private:
-    scheduling_group_key(unsigned long id) :
+    scheduling_group_key(unsigned long id) noexcept :
         _id(id) {}
     unsigned long _id;
-    unsigned long id() const {
+    unsigned long id() const noexcept {
         return _id;
     }
     friend class reactor;
-    friend future<scheduling_group_key> scheduling_group_key_create(scheduling_group_key_config cfg);
+    friend future<scheduling_group_key> scheduling_group_key_create(scheduling_group_key_config cfg) noexcept;
     template<typename T>
-    friend T& scheduling_group_get_specific(scheduling_group sg, scheduling_group_key key);
+    friend T* internal::scheduling_group_get_specific_ptr(scheduling_group sg, scheduling_group_key key) noexcept;
     template<typename T>
-    friend T& scheduling_group_get_specific(scheduling_group_key key);
+    friend T& scheduling_group_get_specific(scheduling_group_key key) noexcept;
 
-    friend unsigned long internal::scheduling_group_key_id(scheduling_group_key key);
+    friend unsigned long internal::scheduling_group_key_id(scheduling_group_key key) noexcept;
 };
 
 namespace internal {
 
-inline unsigned long scheduling_group_key_id(scheduling_group_key key) {
+inline unsigned long scheduling_group_key_id(scheduling_group_key key) noexcept {
     return key.id();
 }
 
@@ -221,7 +234,7 @@ make_scheduling_group_key_config(ConstructorArgs... args) {
  * \ref make_scheduling_group_key_config )
  * @return A future containing \ref scheduling_group_key for the newly created specific value.
  */
-future<scheduling_group_key> scheduling_group_key_create(scheduling_group_key_config cfg);
+future<scheduling_group_key> scheduling_group_key_create(scheduling_group_key_config cfg) noexcept;
 
 /**
  * Returnes a reference to the given scheduling group specific value
@@ -241,15 +254,15 @@ T& scheduling_group_get_specific(scheduling_group sg, scheduling_group_key key);
 class scheduling_group {
     unsigned _id;
 private:
-    explicit scheduling_group(unsigned id) : _id(id) {}
+    explicit scheduling_group(unsigned id) noexcept : _id(id) {}
 public:
     /// Creates a `scheduling_group` object denoting the default group
     constexpr scheduling_group() noexcept : _id(0) {} // must be constexpr for current_scheduling_group_holder
-    bool active() const;
-    const sstring& name() const;
-    bool operator==(scheduling_group x) const { return _id == x._id; }
-    bool operator!=(scheduling_group x) const { return _id != x._id; }
-    bool is_main() const { return _id == 0; }
+    bool active() const noexcept;
+    const sstring& name() const noexcept;
+    bool operator==(scheduling_group x) const noexcept { return _id == x._id; }
+    bool operator!=(scheduling_group x) const noexcept { return _id != x._id; }
+    bool is_main() const noexcept { return _id == 0; }
     template<typename T>
     /**
      * Returnes a reference to this scheduling group specific value
@@ -257,8 +270,8 @@ public:
      * @param key - the key of the value to retrieve.
      * @return A reference to this scheduling specific value.
      */
-    T& get_specific(scheduling_group_key key) {
-        return scheduling_group_get_specific<T>(*this, key);
+    T& get_specific(scheduling_group_key key) noexcept {
+        return *internal::scheduling_group_get_specific_ptr<T>(*this, key);
     }
     /// Adjusts the number of shares allotted to the group.
     ///
@@ -272,13 +285,13 @@ public:
     ///
     /// \param shares number of shares allotted to the group. Use numbers
     ///               in the 1-1000 range.
-    void set_shares(float shares);
-    friend future<scheduling_group> create_scheduling_group(sstring name, float shares);
-    friend future<> destroy_scheduling_group(scheduling_group sg);
-    friend future<> rename_scheduling_group(scheduling_group sg, sstring new_name);
+    void set_shares(float shares) noexcept;
+    friend future<scheduling_group> create_scheduling_group(sstring name, float shares) noexcept;
+    friend future<> destroy_scheduling_group(scheduling_group sg) noexcept;
+    friend future<> rename_scheduling_group(scheduling_group sg, sstring new_name) noexcept;
     friend class reactor;
-    friend unsigned internal::scheduling_group_index(scheduling_group sg);
-    friend scheduling_group internal::scheduling_group_from_index(unsigned index);
+    friend unsigned internal::scheduling_group_index(scheduling_group sg) noexcept;
+    friend scheduling_group internal::scheduling_group_from_index(unsigned index) noexcept;
 
     template<typename SpecificValType, typename Mapper, typename Reducer, typename Initial>
     SEASTAR_CONCEPT( requires requires(SpecificValType specific_val, Mapper mapper, Reducer reducer, Initial initial) {
@@ -302,19 +315,19 @@ namespace internal {
 
 inline
 unsigned
-scheduling_group_index(scheduling_group sg) {
+scheduling_group_index(scheduling_group sg) noexcept {
     return sg._id;
 }
 
 inline
 scheduling_group
-scheduling_group_from_index(unsigned index) {
+scheduling_group_from_index(unsigned index) noexcept {
     return scheduling_group(index);
 }
 
 inline
 scheduling_group*
-current_scheduling_group_ptr() {
+current_scheduling_group_ptr() noexcept {
     // Slow unless constructor is constexpr
     static thread_local scheduling_group sg;
     return &sg;
@@ -326,19 +339,19 @@ current_scheduling_group_ptr() {
 /// Returns the current scheduling group
 inline
 scheduling_group
-current_scheduling_group() {
+current_scheduling_group() noexcept {
     return *internal::current_scheduling_group_ptr();
 }
 
 inline
 scheduling_group
-default_scheduling_group() {
+default_scheduling_group() noexcept {
     return scheduling_group();
 }
 
 inline
 bool
-scheduling_group::active() const {
+scheduling_group::active() const noexcept {
     return *this == current_scheduling_group();
 }
 
@@ -348,7 +361,7 @@ namespace std {
 
 template <>
 struct hash<seastar::scheduling_group> {
-    size_t operator()(seastar::scheduling_group sg) const {
+    size_t operator()(seastar::scheduling_group sg) const noexcept {
         return seastar::internal::scheduling_group_index(sg);
     }
 };
